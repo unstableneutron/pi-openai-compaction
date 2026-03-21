@@ -31,17 +31,18 @@ The extension uses two hooks:
 
 ## Install
 
-From a local checkout:
+From a checkout of this repo:
 
 ```bash
-cd ~/workspace/personal
-pi install ./pi-openai-compaction
+git clone https://github.com/jordyvandomselaar/pi-codex-compaction.git
+cd pi-codex-compaction
+pi install .
 ```
 
-Try without installing:
+Try without installing from the repo root:
 
 ```bash
-pi -e ~/workspace/personal/pi-openai-compaction
+pi -e .
 ```
 
 After installation, run:
@@ -128,7 +129,7 @@ Recommended troubleshooting flow:
 ## Package structure
 
 ```text
-pi-openai-compaction/
+package-root/
 ├── index.ts                    # package entrypoint declared in package.json
 ├── settings.json               # package-local defaults
 ├── src/
@@ -150,7 +151,8 @@ pi-openai-compaction/
 ## Tests
 
 ```bash
-cd ~/workspace/personal/pi-openai-compaction
+git clone https://github.com/jordyvandomselaar/pi-codex-compaction.git
+cd pi-codex-compaction
 bun test
 bun test --coverage --coverage-reporter=text --coverage-reporter=lcov
 bun test ./test/pi-smoke.test.ts
