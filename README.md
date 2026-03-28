@@ -12,6 +12,7 @@ This package preserves the raw compacted window returned by OpenAI's compact end
 
 This package is intentionally narrow.
 
+- **Minimum Pi version:** `@mariozechner/pi-coding-agent >= 0.63.0`
 - **Providers:** `openai`, `openai-codex`
 - **APIs:** `openai-responses`, `openai-codex-responses`
 - **Failure mode:** fail open back to normal Pi behavior
@@ -44,6 +45,8 @@ Try without installing from the repo root:
 ```bash
 pi -e .
 ```
+
+This extension relies on Pi's `modelRegistry.getApiKeyAndHeaders(model)` API introduced in `0.63.0`, so older Pi versions are not supported.
 
 After installation, run:
 

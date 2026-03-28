@@ -6,7 +6,7 @@ export const DEFAULT_SUPPORTED_APIS = ["openai-responses", "openai-codex-respons
 const OPENAI_COMPACT_PATH = "responses/compact";
 const CODEX_COMPACT_PATH = "codex/responses/compact";
 
-type DefaultSupportedProvider = (typeof DEFAULT_SUPPORTED_PROVIDERS)[number];
+type BuiltInSupportedProvider = (typeof DEFAULT_SUPPORTED_PROVIDERS)[number];
 type DefaultSupportedApi = (typeof DEFAULT_SUPPORTED_APIS)[number];
 
 type RuntimeModel = Model<Api>;
@@ -35,12 +35,13 @@ export type ResponsesCompatibleRequestPayload = {
 };
 
 export type NativeCompactionRuntime = {
-	provider: DefaultSupportedProvider;
+	provider: string;
 	api: DefaultSupportedApi;
 	apiFamily: DefaultSupportedApi;
 	model: string;
 	baseUrl: string;
 	apiKey: string;
+	headers?: Record<string, string>;
 	compactPath: string;
 	compactUrl: string;
 	payload?: ResponsesCompatibleRequestPayload;
@@ -102,8 +103,27 @@ export function buildCompactPath(api: DefaultSupportedApi): string {
 	return api === "openai-codex-responses" ? CODEX_COMPACT_PATH : OPENAI_COMPACT_PATH;
 }
 
-export function isSupportedProvider(provider: string): provider is DefaultSupportedProvider {
+export function isSupportedProvider(provider: string): provider is BuiltInSupportedProvider {
 	return (DEFAULT_SUPPORTED_PROVIDERS as readonly string[]).includes(provider);
+}
+
+async function resolveRequestAuth(
+	ctx: ExtensionContext,
+	model: RuntimeModel,
+): Promise<{ apiKey?: string; headers?: Record<string, string> }> {
+	const modelRegistry = ctx.modelRegistry as {
+		getApiKeyAndHeaders?: (currentModel: RuntimeModel) => Promise<
+			| { ok: true; apiKey?: string; headers?: Record<string, string> }
+			| { ok: false; error: string }
+		>;
+	};
+
+	if (typeof modelRegistry.getApiKeyAndHeaders !== "function") {
+		return {};
+	}
+
+	const auth = await modelRegistry.getApiKeyAndHeaders(model);
+	return auth.ok ? { apiKey: auth.apiKey, headers: auth.headers } : {};
 }
 
 export function isSupportedApi(api: string): api is DefaultSupportedApi {
@@ -177,10 +197,10 @@ export async function resolveNativeCompactionEnvironment(
 		};
 	}
 
-	if (!isSupportedProvider(descriptor.provider) || !isSupportedApi(descriptor.api)) {
+	if (!isSupportedApi(descriptor.api)) {
 		return {
 			ok: false,
-			reason: isSupportedProvider(descriptor.provider) ? "unsupported-api" : "unsupported-provider",
+			reason: "unsupported-api",
 			...descriptor,
 		};
 	}
@@ -214,7 +234,7 @@ export async function resolveNativeCompactionEnvironment(
 		requestPayload = payload;
 	}
 
-	const apiKey = await ctx.modelRegistry.getApiKey(currentModel);
+	const { apiKey, headers } = await resolveRequestAuth(ctx, currentModel);
 	if (!apiKey) {
 		return {
 			ok: false,
@@ -232,6 +252,7 @@ export async function resolveNativeCompactionEnvironment(
 			model: descriptor.model,
 			baseUrl: descriptor.baseUrl,
 			apiKey,
+			headers,
 			compactPath: buildCompactPath(descriptor.api),
 			compactUrl: buildCompactUrl(descriptor.baseUrl, descriptor.api),
 			payload: requestPayload,

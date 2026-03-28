@@ -18,11 +18,8 @@ const baseModel = {
 let serializerImportCounter = 0;
 
 async function loadSerializerModule() {
-	const { convertToLlm } = await import(
-		"/Users/jordyvandomselaar/.bun/install/global/node_modules/@mariozechner/pi-coding-agent/dist/core/messages.js"
-	);
 	mock.module("@mariozechner/pi-coding-agent", () => ({
-		convertToLlm,
+		convertToLlm: (messages: unknown[]) => messages,
 	}));
 	return import(`./serializer.ts?unit=${serializerImportCounter++}`);
 }
@@ -59,7 +56,7 @@ test("buildCompactUrl uses codex compact path for openai-codex responses", () =>
 	);
 });
 
-test("executeNativeCompaction propagates model headers and codex auth headers", async () => {
+test("executeNativeCompaction propagates resolved request headers and codex auth headers", async () => {
 	const token = createJwtWithAccountId("acct_123");
 	let fetchArgs: { url?: string; init?: RequestInit } = {};
 	globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
@@ -78,6 +75,10 @@ test("executeNativeCompaction propagates model headers and codex auth headers", 
 			model: "gpt-5.1",
 			baseUrl: "https://chatgpt.com/backend-api",
 			apiKey: token,
+			headers: {
+				"x-test-model-header": "present",
+				"x-test-runtime-header": "resolved",
+			},
 			compactPath: "codex/responses/compact",
 			compactUrl: buildCompactUrl("https://chatgpt.com/backend-api", "openai-codex-responses"),
 			currentModel: {
@@ -87,9 +88,6 @@ test("executeNativeCompaction propagates model headers and codex auth headers", 
 				id: "gpt-5.1",
 				name: "gpt-5.1",
 				baseUrl: "https://chatgpt.com/backend-api",
-				headers: {
-					"x-test-model-header": "present",
-				},
 			},
 		},
 		request: {
@@ -103,6 +101,7 @@ test("executeNativeCompaction propagates model headers and codex auth headers", 
 	expect(fetchArgs.url).toBe("https://chatgpt.com/backend-api/codex/responses/compact");
 	const headers = new Headers(fetchArgs.init?.headers);
 	expect(headers.get("x-test-model-header")).toBe("present");
+	expect(headers.get("x-test-runtime-header")).toBe("resolved");
 	expect(headers.get("authorization")).toBe(`Bearer ${token}`);
 	expect(headers.get("chatgpt-account-id")).toBe("acct_123");
 	expect(headers.get("originator")).toBe("pi");
