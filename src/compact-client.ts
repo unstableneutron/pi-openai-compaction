@@ -121,9 +121,14 @@ function buildCodexUserAgent(): string {
 
 function toHeaders(runtime: NativeCompactionRuntime): Record<string, string> {
 	const headers = new Headers(runtime.currentModel.headers ?? {});
+	for (const [key, value] of Object.entries(runtime.headers ?? {})) {
+		headers.set(key, value);
+	}
 	headers.set("accept", JSON_CONTENT_TYPE);
 	headers.set("content-type", JSON_CONTENT_TYPE);
-	headers.set("authorization", `Bearer ${runtime.apiKey}`);
+	if (!headers.has("authorization")) {
+		headers.set("authorization", `Bearer ${runtime.apiKey}`);
+	}
 
 	if (runtime.provider === "openai-codex") {
 		const accountId = extractCodexAccountId(runtime.apiKey);

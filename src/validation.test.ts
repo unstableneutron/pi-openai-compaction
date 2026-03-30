@@ -312,7 +312,7 @@ function createContext(args: {
 		getSystemPrompt: () => args.systemPrompt ?? "Current instructions v1",
 		model,
 		modelRegistry: {
-			getApiKey: async () => "sk-test-native-compaction",
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "sk-test-native-compaction" }),
 		},
 		sessionManager: {
 			getBranch: () => branchEntries,
