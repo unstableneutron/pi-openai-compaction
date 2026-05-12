@@ -473,6 +473,74 @@ test("manual /compact preserves tool/result ordering + assistant phases and pers
 	expect((result.compaction.details as { compactedWindow: unknown[] }).compactedWindow).toEqual(compactedWindow);
 });
 
+test("manual /compact reuses Codex v1 fields from the last matching Responses request", async () => {
+	const { sessionBeforeCompact, beforeProviderRequest, compactCalls } = await loadHookHarness();
+	const model = { ...defaultModel };
+	const cachedPayload = {
+		model: model.id,
+		instructions: "stale cached provider instructions must not win",
+		input: [{ role: "user", content: [{ type: "input_text", text: "stale cached input must not win" }] }],
+		tools: [{ type: "function", name: "lookup", description: "Lookup things", parameters: { type: "object" } }],
+		parallel_tool_calls: false,
+		reasoning: { effort: "high", summary: "auto" },
+		service_tier: "priority",
+		prompt_cache_key: "cache-key-from-live-request",
+		text: { verbosity: "low" },
+		stream: true,
+		store: true,
+		include: ["reasoning.encrypted_content"],
+		tool_choice: "auto",
+		client_metadata: { source: "normal-response-only" },
+		max_output_tokens: 1234,
+		temperature: 0.2,
+		previous_response_id: "resp_previous_normal_request",
+		prompt_cache_retention: "24h",
+	};
+	const user = createUserEntry("template_user", "Current compact input wins over cached provider input.");
+	const event = {
+		signal: new AbortController().signal,
+		customInstructions: undefined,
+		preparation: {
+			tokensBefore: 512,
+			firstKeptEntryId: user.id,
+			previousSummary: undefined,
+			messagesToSummarize: [toReplayMessage(user)],
+			turnPrefixMessages: [],
+		},
+	};
+
+	await beforeProviderRequest({ payload: cachedPayload }, createContext({ model, systemPrompt: cachedPayload.instructions }));
+	await sessionBeforeCompact(
+		event,
+		createContext({
+			model,
+			systemPrompt: "fresh compact instructions win",
+			sessionContextMessages: [toReplayMessage(user)],
+		}),
+	);
+
+	const compactRequest = compactCalls[0]?.request as Record<string, unknown>;
+	expect(compactRequest.model).toBe(model.id);
+	expect(compactRequest.instructions).toBe("fresh compact instructions win");
+	expect(JSON.stringify(compactRequest.input)).toContain("Current compact input wins over cached provider input.");
+	expect(JSON.stringify(compactRequest.input)).not.toContain("stale cached input must not win");
+	expect(compactRequest.tools).toEqual(cachedPayload.tools);
+	expect(compactRequest.parallel_tool_calls).toBe(false);
+	expect(compactRequest.reasoning).toEqual(cachedPayload.reasoning);
+	expect(compactRequest.service_tier).toBe("priority");
+	expect(compactRequest.prompt_cache_key).toBe("cache-key-from-live-request");
+	expect(compactRequest.text).toEqual(cachedPayload.text);
+	expect(compactRequest.stream).toBeUndefined();
+	expect(compactRequest.store).toBeUndefined();
+	expect(compactRequest.include).toBeUndefined();
+	expect(compactRequest.tool_choice).toBeUndefined();
+	expect(compactRequest.client_metadata).toBeUndefined();
+	expect(compactRequest.max_output_tokens).toBeUndefined();
+	expect(compactRequest.temperature).toBeUndefined();
+	expect(compactRequest.previous_response_id).toBeUndefined();
+	expect(compactRequest.prompt_cache_retention).toBeUndefined();
+});
+
 test("first native compaction sends the full current session context, including Pi's kept recent window", async () => {
 	const { sessionBeforeCompact, compactCalls } = await loadHookHarness();
 	const model = { ...defaultModel };
@@ -504,6 +572,74 @@ test("first native compaction sends the full current session context, including 
 	expect(compactRequest.instructions).toBe("Current instructions include the kept window too");
 	expect(await createInputParitySignature(compactRequest.input)).toEqual(["input:user[1]", "input:user[1]"]);
 	expect(JSON.stringify(compactRequest.input)).toContain("Recent kept window context that must also be compacted.");
+});
+
+test("repeated native compaction normalizes stale developer and system messages from the stored compacted window", async () => {
+	const { sessionBeforeCompact, compactCalls } = await loadHookHarness();
+	const model = { ...defaultModel };
+	const oldKeptUser = createUserEntry("old_normalize_user", "Original context before native compaction.");
+	const staleDeveloper = {
+		type: "message",
+		role: "developer",
+		status: "completed",
+		id: "cmp_stale_developer",
+		content: [{ type: "output_text", text: "Stale developer instructions must be dropped.", annotations: [] }],
+	};
+	const staleSystem = {
+		type: "message",
+		role: "system",
+		status: "completed",
+		id: "cmp_stale_system",
+		content: [{ type: "output_text", text: "Stale system instructions must be dropped.", annotations: [] }],
+	};
+	const keptCompaction = {
+		type: "compaction",
+		encrypted_content: "opaque-compaction-item-survives",
+	};
+	const keptAssistant = {
+		type: "message",
+		role: "assistant",
+		status: "completed",
+		id: "cmp_kept_assistant",
+		content: [{ type: "output_text", text: "Assistant compacted output survives.", annotations: [] }],
+	};
+	const priorCompaction = createCompactionEntry({
+		id: "compaction_normalize_repeat",
+		firstKeptEntryId: oldKeptUser.id,
+		model,
+		compactedWindow: [staleDeveloper, staleSystem, keptCompaction, keptAssistant],
+	});
+	const tailUser = createUserEntry("normalize_tail_user", "New follow-up after normalized compaction.");
+	const event = {
+		signal: new AbortController().signal,
+		customInstructions: undefined,
+		preparation: {
+			tokensBefore: 640,
+			firstKeptEntryId: tailUser.id,
+			previousSummary: NATIVE_COMPACTION_SHIM_SUMMARY,
+			messagesToSummarize: [],
+			turnPrefixMessages: [],
+		},
+	};
+
+	await sessionBeforeCompact(
+		event,
+		createContext({
+			branchEntries: [oldKeptUser, priorCompaction, tailUser],
+			model,
+			systemPrompt: "Current instructions after normalized repeat compact",
+			sessionContextMessages: [createCompactionSummaryMessage(priorCompaction), toReplayMessage(oldKeptUser), toReplayMessage(tailUser)],
+		}),
+	);
+
+	const compactRequest = compactCalls[0]?.request as { input: unknown[] };
+	expect(compactRequest.input).toEqual([
+		keptCompaction,
+		keptAssistant,
+		...(await serializeResponsesInput(model, [toReplayMessage(tailUser)])),
+	]);
+	expect(JSON.stringify(compactRequest.input)).not.toContain("Stale developer instructions must be dropped.");
+	expect(JSON.stringify(compactRequest.input)).not.toContain("Stale system instructions must be dropped.");
 });
 
 test("repeated native compaction reuses the latest stored compacted window instead of Pi's shim summary", async () => {
@@ -667,6 +803,62 @@ test("first post-compaction turn rewrites to fresh preamble + opaque compacted w
 		"Old assistant context that should disappear after native replay.",
 	);
 	expect(JSON.stringify(rewritten.input)).not.toContain("The conversation history before this point was compacted");
+});
+
+test("post-compaction provider replay normalizes stale developer and system messages from native compact output", async () => {
+	const { beforeProviderRequest } = await loadHookHarness();
+	const model = { ...defaultModel };
+	const keptUser = createUserEntry("kept_normalized_replay_user", "Old user context that should disappear.");
+	const staleDeveloper = {
+		type: "message",
+		role: "developer",
+		status: "completed",
+		id: "cmp_replay_stale_developer",
+		content: [{ type: "output_text", text: "Stale developer replay output must be dropped.", annotations: [] }],
+	};
+	const staleSystem = {
+		type: "message",
+		role: "system",
+		status: "completed",
+		id: "cmp_replay_stale_system",
+		content: [{ type: "output_text", text: "Stale system replay output must be dropped.", annotations: [] }],
+	};
+	const keptAssistant = {
+		type: "message",
+		role: "assistant",
+		status: "completed",
+		id: "cmp_replay_kept_assistant",
+		content: [{ type: "output_text", text: "Normalized assistant replay survives.", annotations: [] }],
+	};
+	const compactionEntry = createCompactionEntry({
+		id: "compaction_normalized_replay",
+		firstKeptEntryId: keptUser.id,
+		model,
+		compactedWindow: [staleDeveloper, staleSystem, keptAssistant],
+	});
+	const currentUser = createUserEntry("current_normalized_replay_user", "Continue after normalized replay.");
+	const branchEntries = [keptUser, compactionEntry, currentUser];
+	const payload = await buildPiReplayPayload({
+		model,
+		branchEntries,
+		compactionEntry,
+		instructions: "Current instructions after normalized replay",
+		freshPreamble: "Fresh preamble after normalized replay",
+	});
+
+	const rewritten = (await beforeProviderRequest(
+		{ payload },
+		createContext({ branchEntries, model, systemPrompt: payload.instructions }),
+	)) as { input: unknown[]; instructions: string };
+
+	expect(rewritten.input).toEqual([
+		payload.input[0],
+		keptAssistant,
+		...(await serializeResponsesInput(model, [toReplayMessage(currentUser)])),
+	]);
+	expect(JSON.stringify(rewritten.input)).toContain("Normalized assistant replay survives.");
+	expect(JSON.stringify(rewritten.input)).not.toContain("Stale developer replay output must be dropped.");
+	expect(JSON.stringify(rewritten.input)).not.toContain("Stale system replay output must be dropped.");
 });
 
 test("trailing provider-authored developer prompts survive native replay in place", async () => {

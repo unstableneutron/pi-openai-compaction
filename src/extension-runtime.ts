@@ -8,9 +8,17 @@ import { executeNativeCompaction } from "./compact-client";
 import { writeDebugArtifact } from "./debug";
 import { resolveLatestNativeCompactionEntry } from "./details-store";
 import {
+	normalizeNativeCompactedWindowForReplay,
 	rewriteResponsesPayloadWithNativeReplay,
 	serializeLiveTailToResponsesInput,
 } from "./payload-rewrite";
+import {
+	applyNativeCompactionRequestTemplate,
+	createNativeCompactionRequestTemplate,
+	isMatchingNativeCompactionRequestTemplate,
+	type NativeCompactionRequestTemplate,
+	type NativeCompactionRequestTemplateIdentity,
+} from "./request-template";
 import { resolveNativeCompactionEnvironment } from "./runtime";
 import { serializeMessagesToCompactRequest } from "./serializer";
 import { loadExtensionSettings } from "./settings";
@@ -21,6 +29,8 @@ import {
 	isNativeCompactionDetails,
 	type NativeCompactionRequestMeta,
 } from "./types";
+
+let latestRequestTemplate: NativeCompactionRequestTemplate | undefined;
 
 function buildCompactionRequestMeta(event: SessionBeforeCompactEvent): NativeCompactionRequestMeta {
 	return {
@@ -49,8 +59,33 @@ function getCompactionIdentityDebugInfo(entry: { details?: unknown } | undefined
 		: undefined;
 }
 
-function cloneOpaqueWindow(window: readonly unknown[]): unknown[] {
-	return window.map((item) => structuredClone(item));
+function getSessionId(ctx: ExtensionContext): string | undefined {
+	try {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const normalized = sessionId?.trim();
+		return normalized ? normalized : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function buildRequestTemplateIdentity(
+	runtime: {
+		provider: string;
+		api: string;
+		model: string;
+		baseUrl: string;
+	},
+	ctx: ExtensionContext,
+): NativeCompactionRequestTemplateIdentity {
+	const sessionId = getSessionId(ctx);
+	return {
+		provider: runtime.provider,
+		api: runtime.api,
+		model: runtime.model,
+		baseUrl: runtime.baseUrl,
+		...(sessionId ? { sessionId } : {}),
+	};
 }
 
 function buildCompactionInstructions(systemPrompt: string, customInstructions?: string): string {
@@ -124,12 +159,31 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 	let requestSource: "session-context" | "latest-native-replay";
 	let request = undefined as ReturnType<typeof serializeMessagesToCompactRequest> | undefined;
 	if (latestNativeCompaction.ok) {
+		const compactedWindow = normalizeNativeCompactedWindowForReplay(latestNativeCompaction.entry.details.compactedWindow);
+		if (!compactedWindow) {
+			writeDebugArtifact(
+				"compaction-event",
+				{
+					event: "session_before_compact.skip",
+					reason: "invalid-compacted-window",
+					provider: runtime.provider,
+					api: runtime.api,
+					model: runtime.model,
+					baseUrl: runtime.baseUrl,
+					latestCompactionIndex: latestNativeCompaction.index,
+				},
+				settings,
+				piContext,
+			);
+			return undefined;
+		}
+
 		const liveTailEntries = branchEntries.slice(latestNativeCompaction.index + 1);
 		requestSource = "latest-native-replay";
 		request = {
 			model: runtime.currentModel.id,
 			input: [
-				...cloneOpaqueWindow(latestNativeCompaction.entry.details.compactedWindow),
+				...compactedWindow,
 				...serializeLiveTailToResponsesInput({ model: runtime.currentModel, entries: liveTailEntries }),
 			],
 			instructions,
@@ -160,12 +214,19 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 		return undefined;
 	}
 
+	const requestTemplateIdentity = buildRequestTemplateIdentity(runtime, piContext);
+	const requestTemplate = isMatchingNativeCompactionRequestTemplate(latestRequestTemplate, requestTemplateIdentity)
+		? latestRequestTemplate
+		: undefined;
+	const compactRequest = applyNativeCompactionRequestTemplate(request, requestTemplate);
+
 	const compactResult = await executeNativeCompaction({
 		runtime,
-		request,
+		request: compactRequest,
 		signal: event.signal,
 		settings,
 		context: piContext,
+		sessionId: getSessionId(piContext),
 	});
 
 	if (compactResult.ok === false) {
@@ -225,7 +286,8 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 			api: runtime.api,
 			model: runtime.model,
 			requestSource,
-			requestInputItems: request.input.length,
+			requestTemplateFields: requestTemplate ? Object.keys(requestTemplate.fields).sort() : [],
+			requestInputItems: compactRequest.input.length,
 			compactResponseId: compactResult.compactResponseId,
 			compactedItems: compactResult.compactedWindow.length,
 			firstKeptEntryId: event.preparation.firstKeptEntryId,
@@ -272,6 +334,17 @@ async function handleBeforeProviderRequest(event: BeforeProviderRequestEvent, ct
 	}
 
 	const runtime = resolution.runtime;
+	const requestTemplateIdentity = buildRequestTemplateIdentity(runtime, ctx);
+	const requestTemplate = requestTemplateIdentity.sessionId
+		? createNativeCompactionRequestTemplate({
+			identity: requestTemplateIdentity,
+			payload: runtime.payload,
+		})
+		: undefined;
+	if (requestTemplate) {
+		latestRequestTemplate = requestTemplate;
+	}
+
 	const branchEntries = ctx.sessionManager.getBranch();
 	const latestNativeCompaction = resolveLatestNativeCompactionEntry(branchEntries, {
 		provider: runtime.provider,

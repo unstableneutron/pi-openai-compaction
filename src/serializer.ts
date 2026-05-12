@@ -92,6 +92,12 @@ export type NativeCompactionRequestBody = {
 	model: string;
 	input: ResponsesInputItem[];
 	instructions: string;
+	tools?: unknown;
+	parallel_tool_calls?: unknown;
+	reasoning?: unknown;
+	service_tier?: unknown;
+	prompt_cache_key?: unknown;
+	text?: unknown;
 };
 
 export type SerializeResponsesMessagesOptions = {

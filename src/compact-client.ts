@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { writeDebugArtifact } from "./debug";
 import type { NativeCompactionRuntime } from "./runtime";
 import type { NativeCompactionRequestBody } from "./serializer";
@@ -47,6 +48,8 @@ export type ExecuteNativeCompactionOptions = {
 	signal?: AbortSignal;
 	settings?: ExtensionSettings;
 	context?: ArtifactContext;
+	sessionId?: string;
+	clientRequestId?: string;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -119,7 +122,15 @@ function buildCodexUserAgent(): string {
 	return `pi (${platform}; ${arch})`;
 }
 
-function toHeaders(runtime: NativeCompactionRuntime): Record<string, string> {
+function normalizeHeaderValue(value: string | undefined): string | undefined {
+	const normalized = value?.trim();
+	return normalized ? normalized : undefined;
+}
+
+function toHeaders(
+	runtime: NativeCompactionRuntime,
+	requestContext: Pick<ExecuteNativeCompactionOptions, "sessionId" | "clientRequestId"> = {},
+): Record<string, string> {
 	const headers = new Headers(runtime.currentModel.headers ?? {});
 	for (const [key, value] of Object.entries(runtime.headers ?? {})) {
 		headers.set(key, value);
@@ -128,6 +139,16 @@ function toHeaders(runtime: NativeCompactionRuntime): Record<string, string> {
 	headers.set("content-type", JSON_CONTENT_TYPE);
 	if (!headers.has("authorization")) {
 		headers.set("authorization", `Bearer ${runtime.apiKey}`);
+	}
+
+	const sessionId = normalizeHeaderValue(requestContext.sessionId);
+	const clientRequestId =
+		normalizeHeaderValue(requestContext.clientRequestId) ?? (sessionId ? `pi-compact-${randomUUID()}` : undefined);
+	if (sessionId) {
+		headers.set("session_id", sessionId);
+	}
+	if (clientRequestId) {
+		headers.set("x-client-request-id", clientRequestId);
 	}
 
 	if (runtime.provider === "openai-codex") {
@@ -158,8 +179,8 @@ function writeCompactArtifact(
 export async function executeNativeCompaction(
 	options: ExecuteNativeCompactionOptions,
 ): Promise<NativeCompactionClientResult> {
-	const { runtime, request, signal, settings, context } = options;
-	const headers = toHeaders(runtime);
+	const { runtime, request, signal, settings, context, sessionId, clientRequestId } = options;
+	const headers = toHeaders(runtime, { sessionId, clientRequestId });
 
 	if (signal?.aborted) {
 		const aborted: NativeCompactionClientFailure = {

@@ -171,6 +171,15 @@ function cloneOpaqueCompactedWindow(compactedWindow: readonly unknown[]): unknow
 	return cloned;
 }
 
+function isStalePromptMessageFromCompactedWindow(item: unknown): boolean {
+	return isRecord(item) && item.type === "message" && (item.role === "developer" || item.role === "system");
+}
+
+export function normalizeNativeCompactedWindowForReplay(compactedWindow: readonly unknown[]): unknown[] | undefined {
+	const cloned = cloneOpaqueCompactedWindow(compactedWindow);
+	return cloned?.filter((item) => !isStalePromptMessageFromCompactedWindow(item));
+}
+
 function cloneResponsesInputSlice(items: readonly unknown[]): ResponsesInputItem[] | undefined {
 	const cloned: ResponsesInputItem[] = [];
 
@@ -425,7 +434,7 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		};
 	}
 
-	const compactedWindow = cloneOpaqueCompactedWindow(args.compactionEntry.details.compactedWindow);
+	const compactedWindow = normalizeNativeCompactedWindowForReplay(args.compactionEntry.details.compactedWindow);
 	if (!compactedWindow) {
 		return {
 			ok: false,
