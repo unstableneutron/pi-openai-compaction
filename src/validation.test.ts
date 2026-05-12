@@ -805,6 +805,51 @@ test("first post-compaction turn rewrites to fresh preamble + opaque compacted w
 	expect(JSON.stringify(rewritten.input)).not.toContain("The conversation history before this point was compacted");
 });
 
+test("first post-compaction provider request rewrites pending live user input not yet persisted", async () => {
+	const { beforeProviderRequest } = await loadHookHarness();
+	const model = { ...defaultModel };
+	const keptUser = createUserEntry("kept_pending_user", "Old user context that should be replaced by native replay.");
+	const compactedWindow = [
+		{
+			type: "compaction",
+			encrypted_content: "opaque-pending-window",
+		},
+	];
+	const compactionEntry = createCompactionEntry({
+		id: "compaction_pending_live_input",
+		firstKeptEntryId: keptUser.id,
+		model,
+		compactedWindow,
+	});
+	const pendingUser = createUserEntry(
+		"pending_live_user",
+		"This live user message is in the provider payload before branch persistence catches up.",
+	);
+	const persistedBranchEntries = [keptUser, compactionEntry];
+	const payload = await buildPiReplayPayload({
+		model,
+		branchEntries: [...persistedBranchEntries, pendingUser],
+		compactionEntry,
+		instructions: "Current instructions with pending live input",
+		freshPreamble: "Fresh preamble with pending live input",
+	});
+
+	const rewritten = (await beforeProviderRequest(
+		{ payload },
+		createContext({ branchEntries: persistedBranchEntries, model, systemPrompt: payload.instructions }),
+	)) as { input: unknown[]; instructions: string };
+
+	expect(rewritten.instructions).toBe("Current instructions with pending live input");
+	expect(rewritten.input).toEqual([
+		payload.input[0],
+		...compactedWindow,
+		...(await serializeResponsesInput(model, [toReplayMessage(pendingUser)])),
+	]);
+	expect(JSON.stringify(rewritten.input)).toContain("This live user message is in the provider payload");
+	expect(JSON.stringify(rewritten.input)).not.toContain("Old user context that should be replaced by native replay.");
+	expect(JSON.stringify(rewritten.input)).not.toContain("The conversation history before this point was compacted");
+});
+
 test("post-compaction provider replay normalizes stale developer and system messages from native compact output", async () => {
 	const { beforeProviderRequest } = await loadHookHarness();
 	const model = { ...defaultModel };

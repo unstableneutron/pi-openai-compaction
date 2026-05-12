@@ -194,6 +194,20 @@ function cloneResponsesInputSlice(items: readonly unknown[]): ResponsesInputItem
 	return cloned;
 }
 
+function startsWithEquivalentValues(values: readonly unknown[], prefix: readonly unknown[]): boolean {
+	if (values.length < prefix.length) {
+		return false;
+	}
+
+	for (let index = 0; index < prefix.length; index++) {
+		if (!areEquivalentValues(values[index], prefix[index])) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
 function areEquivalentValues(left: unknown, right: unknown): boolean {
 	if (Object.is(left, right)) {
 		return true;
@@ -452,14 +466,23 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		...preCompactionKeptMessages,
 		...postCompactionTailMessages,
 	]);
-	const originalPiReplayInput: ResponsesInputItem[] = [
+	const expectedPersistedPiReplayInput: ResponsesInputItem[] = [
 		...freshPreamble.leadingInput,
 		...serializedPiHistoryInput,
 		...freshPreamble.trailingInput,
 	];
 
-	if (!areEquivalentValues(args.payload.input, originalPiReplayInput)) {
-		const parity = compareResponsesInputParity(args.payload.input, originalPiReplayInput);
+	const freshPreambleCount = freshPreamble.leadingInput.length;
+	const trailingPreambleCount = freshPreamble.trailingInput.length;
+	const replayTailEndIndex = args.payload.input.length - trailingPreambleCount;
+	const actualReplayCoreInput = args.payload.input.slice(freshPreambleCount, replayTailEndIndex);
+	const replayShapeMatches =
+		replayTailEndIndex >= freshPreambleCount &&
+		areEquivalentValues(args.payload.input.slice(0, freshPreambleCount), freshPreamble.leadingInput) &&
+		startsWithEquivalentValues(actualReplayCoreInput, serializedPiHistoryInput) &&
+		areEquivalentValues(args.payload.input.slice(replayTailEndIndex), freshPreamble.trailingInput);
+	if (!replayShapeMatches) {
+		const parity = compareResponsesInputParity(args.payload.input, expectedPersistedPiReplayInput);
 		return {
 			ok: false,
 			reason: "expected-pi-replay-mismatch",
@@ -471,8 +494,13 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		};
 	}
 
-	const freshPreambleCount = freshPreamble.leadingInput.length;
-	const trailingPreambleCount = freshPreamble.trailingInput.length;
+	const originalPiReplayInput = cloneResponsesInputSlice(args.payload.input);
+	if (!originalPiReplayInput) {
+		return {
+			ok: false,
+			reason: "expected-pi-replay-mismatch",
+		};
+	}
 	const compactionSummaryCount = serializeMessagesToResponsesInput(args.model, [compactionSummaryMessage]).length;
 	const preCompactionKeptCount = serializeMessagesToResponsesInput(args.model, preCompactionKeptMessages).length;
 	const tailStartIndex = freshPreambleCount + compactionSummaryCount + preCompactionKeptCount;
