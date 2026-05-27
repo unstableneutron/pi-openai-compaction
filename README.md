@@ -25,10 +25,15 @@ The extension uses two hooks:
 1. `session_before_compact`
    - serialize the current Pi session into an OpenAI Responses-compatible compact request
    - call the compact endpoint
-   - persist the returned compacted window in the compaction entry details
+   - validate and persist the returned compacted window in the compaction entry details
+   - if native compact fails after a prior native compact, keep that prior opaque window available for Pi's fallback summarizer
 2. `before_provider_request`
    - intercept the next supported Responses request
    - replace Pi's summary-oriented replay with native replay
+   - tolerate omitted kept windows, pending live input, and Pi fallback compactions after an older native compact
+3. `session_compact` / `context`
+   - add a visible native-compaction marker to the session
+   - keep that marker out of LLM context and replay payloads
 
 ## Install
 
@@ -138,6 +143,7 @@ package-root/
 ├── src/
 │   ├── extension-runtime.ts    # hook registration and top-level wiring
 │   ├── settings.ts             # layered settings loader + env overrides
+│   ├── compaction-output.ts    # compact endpoint output sanitization helpers
 │   ├── debug.ts                # artifact writing + redaction helpers
 │   ├── runtime.ts              # provider/api/model/baseUrl/apiKey resolution
 │   ├── supported-environment.ts

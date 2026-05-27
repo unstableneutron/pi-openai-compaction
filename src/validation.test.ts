@@ -1,6 +1,7 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import {
 	DEFAULT_EXTENSION_SETTINGS,
+	NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE,
 	NATIVE_COMPACTION_SHIM_SUMMARY,
 	createNativeCompactionDetails,
 	type ExtensionSettings,
@@ -43,18 +44,25 @@ type TestSessionEntry = {
 
 type HookHandler = (event: unknown, ctx: unknown) => Promise<unknown>;
 
-type CompactClientResult = {
-	ok: true;
-	status: number;
-	compactedWindow: unknown[];
-	compactResponseId?: string;
-	createdAt?: string;
-	response: {
-		id?: string;
-		created_at?: number | string;
-		output: unknown[];
-	};
-};
+type CompactClientResult =
+	| {
+			ok: true;
+			status: number;
+			compactedWindow: unknown[];
+			compactResponseId?: string;
+			createdAt?: string;
+			response: {
+				id?: string;
+				created_at?: number | string;
+				output: unknown[];
+			};
+		}
+	| {
+			ok: false;
+			reason: "network-error" | "non-2xx" | "aborted";
+			status?: number;
+			errorMessage?: string;
+		};
 
 type HookHarnessOptions = {
 	compactResult?: CompactClientResult;
@@ -331,9 +339,13 @@ function createContext(args: {
 async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 	sessionBeforeCompact: HookHandler;
 	beforeProviderRequest: HookHandler;
+	sessionCompact?: HookHandler;
+	context?: HookHandler;
 	compactCalls: Array<Record<string, unknown>>;
+	sentMessages: Array<{ message: unknown; options: unknown }>;
 }> {
 	const compactCalls: Array<Record<string, unknown>> = [];
+	const sentMessages: Array<{ message: unknown; options: unknown }> = [];
 
 	registerPiCodingAgentMock();
 
@@ -374,6 +386,9 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 		on: (eventName: string, handler: HookHandler) => {
 			handlers.set(eventName, handler);
 		},
+		sendMessage: (message: unknown, options: unknown) => {
+			sentMessages.push({ message, options });
+		},
 	} as never);
 
 	const sessionBeforeCompact = handlers.get("session_before_compact");
@@ -385,7 +400,10 @@ async function loadHookHarness(options: HookHarnessOptions = {}): Promise<{
 	return {
 		sessionBeforeCompact,
 		beforeProviderRequest,
+		sessionCompact: handlers.get("session_compact"),
+		context: handlers.get("context"),
 		compactCalls,
+		sentMessages,
 	};
 }
 
@@ -906,6 +924,168 @@ test("post-compaction provider replay normalizes stale developer and system mess
 	expect(JSON.stringify(rewritten.input)).not.toContain("Stale system replay output must be dropped.");
 });
 
+test("native replay accepts payloads that omit the pre-compaction kept window", async () => {
+	const { beforeProviderRequest } = await loadHookHarness();
+	const model = { ...defaultModel };
+	const keptUser = createUserEntry("omitted_kept_user", "Old kept context that Pi omitted from replay.");
+	const compactedWindow = [{ type: "compaction", encrypted_content: "opaque-omitted-kept-window" }];
+	const compactionEntry = createCompactionEntry({
+		id: "compaction_omitted_kept",
+		firstKeptEntryId: keptUser.id,
+		model,
+		compactedWindow,
+	});
+	const currentUser = createUserEntry("omitted_kept_current", "Current tail after omitted kept window.");
+	const branchEntries = [keptUser, compactionEntry, currentUser];
+	const compactionSummaryInput = await serializeResponsesInput(model, [createCompactionSummaryMessage(compactionEntry)]);
+	const currentTailInput = await serializeResponsesInput(model, [toReplayMessage(currentUser)]);
+	const payload = {
+		model: model.id,
+		instructions: "Instructions for omitted kept replay",
+		input: [
+			{ role: "developer", content: "Fresh preamble for omitted kept replay" },
+			...compactionSummaryInput,
+			...currentTailInput,
+		],
+	};
+
+	const rewritten = (await beforeProviderRequest(
+		{ payload },
+		createContext({ branchEntries, model, systemPrompt: payload.instructions }),
+	)) as { input: unknown[]; instructions: string };
+
+	expect(rewritten.instructions).toBe("Instructions for omitted kept replay");
+	expect(rewritten.input).toEqual([payload.input[0], ...compactedWindow, ...currentTailInput]);
+	expect(JSON.stringify(rewritten.input)).not.toContain("Old kept context that Pi omitted from replay.");
+});
+
+test("native replay preserves an older native blob across a newer Pi fallback compaction", async () => {
+	const { beforeProviderRequest } = await loadHookHarness();
+	const model = { ...defaultModel };
+	const keptUser = createUserEntry("fallback_native_kept", "Original context before native compaction.");
+	const nativeCompaction = createCompactionEntry({
+		id: "native_compaction_before_fallback",
+		firstKeptEntryId: keptUser.id,
+		model,
+		compactedWindow: [{ type: "compaction", encrypted_content: "opaque-native-before-fallback" }],
+	});
+	const fallbackTail = createUserEntry("fallback_tail", "Context between native and Pi fallback.");
+	const piFallback: TestSessionEntry = {
+		type: "compaction",
+		id: "pi_fallback_compaction",
+		timestamp: nextTimestamp(),
+		summary: "Pi fallback summary",
+		firstKeptEntryId: fallbackTail.id,
+		tokensBefore: 900,
+	};
+	const currentUser = createUserEntry("after_pi_fallback", "Current context after Pi fallback.");
+	const branchEntries = [keptUser, nativeCompaction, fallbackTail, piFallback, currentUser];
+	const payload = {
+		model: model.id,
+		instructions: "Instructions after Pi fallback",
+		input: [
+			{ role: "developer", content: "Fresh preamble after Pi fallback" },
+			...(await serializeResponsesInput(model, [
+				createCompactionSummaryMessage(piFallback),
+				toReplayMessage(currentUser),
+			])),
+		],
+	};
+
+	const rewritten = (await beforeProviderRequest(
+		{ payload },
+		createContext({ branchEntries, model, systemPrompt: payload.instructions }),
+	)) as { input: unknown[]; instructions: string };
+
+	expect(rewritten.instructions).toBe("Instructions after Pi fallback");
+	expect((rewritten.input[1] as { encrypted_content?: string }).encrypted_content).toBe("opaque-native-before-fallback");
+	expect(JSON.stringify(rewritten.input)).toContain("Pi fallback summary");
+	expect(JSON.stringify(rewritten.input)).toContain("Current context after Pi fallback.");
+	expect(JSON.stringify(rewritten.input)).not.toContain("Original context before native compaction.");
+});
+
+test("failed native compact injects the previous native window into the Pi fallback summarization request", async () => {
+	const model = { ...defaultModel };
+	const keptUser = createUserEntry("fallback_inject_kept", "Original context before previous native compaction.");
+	const priorCompaction = createCompactionEntry({
+		id: "prior_native_for_fallback_injection",
+		firstKeptEntryId: keptUser.id,
+		model,
+		compactedWindow: [{ type: "compaction", encrypted_content: "opaque-window-for-pi-fallback" }],
+	});
+	const tailUser = createUserEntry("fallback_inject_tail", "Tail that native compact failed to compact.");
+	const { sessionBeforeCompact, beforeProviderRequest } = await loadHookHarness({
+		compactResult: { ok: false, reason: "network-error", errorMessage: "offline" },
+	});
+	const event = {
+		signal: new AbortController().signal,
+		customInstructions: undefined,
+		preparation: {
+			tokensBefore: 1024,
+			firstKeptEntryId: tailUser.id,
+			previousSummary: NATIVE_COMPACTION_SHIM_SUMMARY,
+			messagesToSummarize: [],
+			turnPrefixMessages: [],
+		},
+	};
+	const ctx = createContext({
+		branchEntries: [keptUser, priorCompaction, tailUser],
+		model,
+		systemPrompt: "Current instructions for failed native compact",
+	});
+
+	expect(await sessionBeforeCompact(event, ctx)).toBeUndefined();
+	const piFallbackPayload = {
+		model: model.id,
+		input: [
+			{ role: "developer", content: "You are a context summarization assistant. ONLY output the structured summary." },
+			{ role: "user", content: [{ type: "input_text", text: "<conversation>fallback</conversation>" }] },
+		],
+	};
+	const rewritten = (await beforeProviderRequest({ payload: piFallbackPayload }, ctx)) as { input: unknown[] };
+
+	expect(rewritten.input.map((item) => (item as { type?: string; role?: string }).type ?? (item as { role?: string }).role)).toEqual([
+		"developer",
+		"compaction",
+		"user",
+	]);
+	expect((rewritten.input[1] as { encrypted_content?: string }).encrypted_content).toBe("opaque-window-for-pi-fallback");
+});
+
+test("session_before_compact fails open when native compact output is not structured", async () => {
+	const { sessionBeforeCompact, compactCalls } = await loadHookHarness({
+		compactResult: {
+			ok: true,
+			status: 200,
+			compactedWindow: ["not structured"],
+			compactResponseId: "resp_invalid_output",
+			createdAt: nextTimestamp(),
+			response: { id: "resp_invalid_output", created_at: nextTimestamp(), output: ["not structured"] },
+		},
+	});
+	const model = { ...defaultModel };
+	const user = createUserEntry("invalid_output_user", "Compact this context.");
+	const event = {
+		signal: new AbortController().signal,
+		customInstructions: undefined,
+		preparation: {
+			tokensBefore: 512,
+			firstKeptEntryId: user.id,
+			previousSummary: undefined,
+			messagesToSummarize: [toReplayMessage(user)],
+			turnPrefixMessages: [],
+		},
+	};
+
+	const result = await sessionBeforeCompact(
+		event,
+		createContext({ model, sessionContextMessages: [toReplayMessage(user)] }),
+	);
+
+	expect(compactCalls).toHaveLength(1);
+	expect(result).toBeUndefined();
+});
+
 test("trailing provider-authored developer prompts survive native replay in place", async () => {
 	const { beforeProviderRequest } = await loadHookHarness();
 	const model = { ...defaultModel, reasoning: true };
@@ -1097,6 +1277,35 @@ test("a second compaction replays only the latest compacted window and keeps fre
 	expect(JSON.stringify(rewritten.input)).toContain("Second compaction window");
 	expect(JSON.stringify(rewritten.input)).not.toContain("First compaction window");
 	expect(JSON.stringify(rewritten.input)).not.toContain("Interim question between compactions.");
+});
+
+test("native compaction emits a display marker and filters it from context", async () => {
+	const { sessionCompact, context, sentMessages } = await loadHookHarness();
+	if (!sessionCompact || !context) throw new Error("Expected session_compact and context hooks");
+	const model = { ...defaultModel };
+	const user = createUserEntry("display_marker_user", "Context before native compaction marker.");
+	const compactionEntry = createCompactionEntry({
+		id: "display_marker_compaction",
+		firstKeptEntryId: user.id,
+		model,
+		compactedWindow: [{ type: "compaction", encrypted_content: "opaque-display-marker" }],
+	});
+
+	await sessionCompact({ fromExtension: true, compactionEntry }, createContext({ model }));
+
+	expect(sentMessages).toHaveLength(1);
+	expect((sentMessages[0]?.message as { customType?: string }).customType).toBe(NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE);
+	expect(sentMessages[0]?.options).toEqual({ triggerTurn: false });
+	const filtered = await context(
+		{
+			messages: [
+				{ role: "user", content: "keep me" },
+				{ role: "custom", customType: NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE, content: "hide me" },
+			],
+		},
+		createContext({ model }),
+	) as { messages: unknown[] };
+	expect(filtered.messages).toEqual([{ role: "user", content: "keep me" }]);
 });
 
 test("unsupported model/provider switching fails open instead of replaying stale native state", async () => {

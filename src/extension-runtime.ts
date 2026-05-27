@@ -5,8 +5,9 @@ import type {
 	SessionBeforeCompactEvent,
 } from "@mariozechner/pi-coding-agent";
 import { executeNativeCompaction } from "./compact-client";
+import { sanitizeCompactedWindow, summarizeCompactionOutputForDiagnostics } from "./compaction-output";
 import { writeDebugArtifact } from "./debug";
-import { resolveLatestNativeCompactionEntry } from "./details-store";
+import { findLatestNativeCompactionEntry, resolveLatestNativeCompactionEntry } from "./details-store";
 import {
 	normalizeNativeCompactedWindowForReplay,
 	rewriteResponsesPayloadWithNativeReplay,
@@ -19,18 +20,32 @@ import {
 	type NativeCompactionRequestTemplate,
 	type NativeCompactionRequestTemplateIdentity,
 } from "./request-template";
-import { resolveNativeCompactionEnvironment } from "./runtime";
-import { serializeMessagesToCompactRequest } from "./serializer";
+import { isResponsesCompatiblePayload, resolveNativeCompactionEnvironment, type ResponsesCompatibleRequestPayload } from "./runtime";
+import { serializeMessagesToCompactRequest, type ResponsesInputItem } from "./serializer";
 import { loadExtensionSettings } from "./settings";
 import {
 	createNativeCompactionDetails,
 	createNativeCompactionShimResult,
 	EXTENSION_ID,
 	isNativeCompactionDetails,
+	NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE,
+	NATIVE_COMPACTION_DISPLAY_TEXT,
 	type NativeCompactionRequestMeta,
 } from "./types";
 
 let latestRequestTemplate: NativeCompactionRequestTemplate | undefined;
+let pendingPiCompactionNativeWindow: {
+	window: ResponsesInputItem[];
+	provider: string;
+	api: string;
+	baseUrl: string;
+	sessionId?: string;
+	sourceCompactionEntryId?: string;
+} | undefined;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
 
 function buildCompactionRequestMeta(event: SessionBeforeCompactEvent): NativeCompactionRequestMeta {
 	return {
@@ -67,6 +82,100 @@ function getSessionId(ctx: ExtensionContext): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+function cloneCompactedWindow(window: readonly unknown[]): ResponsesInputItem[] | undefined {
+	if (!window.every(isRecord)) return undefined;
+	return window.map((item) => structuredClone(item) as ResponsesInputItem);
+}
+
+function stashLatestNativeWindowForPiCompactionFallback(args: {
+	ctx: ExtensionContext;
+	branchEntries: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>;
+	runtime: { provider: string; api: string; baseUrl: string };
+}): boolean {
+	pendingPiCompactionNativeWindow = undefined;
+	const nativeEntry = resolveLatestNativeCompactionEntry(args.branchEntries, {
+		provider: args.runtime.provider,
+		api: args.runtime.api,
+		baseUrl: args.runtime.baseUrl,
+	});
+	if (!nativeEntry.ok) return false;
+	const compactedWindow = cloneCompactedWindow(normalizeNativeCompactedWindowForReplay(nativeEntry.entry.details.compactedWindow) ?? []);
+	if (!compactedWindow || compactedWindow.length === 0) return false;
+	pendingPiCompactionNativeWindow = {
+		window: compactedWindow,
+		provider: args.runtime.provider,
+		api: args.runtime.api,
+		baseUrl: args.runtime.baseUrl,
+		sessionId: getSessionId(args.ctx),
+		sourceCompactionEntryId: nativeEntry.entry.id,
+	};
+	return true;
+}
+
+function textFromResponsesContent(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((item) => isRecord(item) && item.type === "input_text" && typeof item.text === "string" ? item.text : "")
+		.join("\n");
+}
+
+function isNativeCompactionDisplayMessage(message: unknown): boolean {
+	return isRecord(message) && message.role === "custom" && message.customType === NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE;
+}
+
+function isPiCompactionSummarizationPayload(payload: ResponsesCompatibleRequestPayload): boolean {
+	const instructions = typeof payload.instructions === "string" ? payload.instructions : "";
+	if (/compact|summar/i.test(instructions)) return true;
+
+	return payload.input.some((item) => {
+		if (!isRecord(item)) return false;
+		const role = item.role;
+		const text = textFromResponsesContent(item.content);
+		if ((role === "system" || role === "developer") && /compact|summar/i.test(text)) return true;
+		if (role === "user" && /<conversation>|previous compaction summary|summary/i.test(text)) return true;
+		return false;
+	});
+}
+
+function injectPendingNativeWindowIntoPiCompactionRequest(args: {
+	payload: unknown;
+	ctx: ExtensionContext;
+	runtime: { provider: string; api: string; baseUrl: string };
+}): ResponsesCompatibleRequestPayload | undefined {
+	const pending = pendingPiCompactionNativeWindow;
+	if (!pending || pending.window.length === 0) return undefined;
+	if (!isResponsesCompatiblePayload(args.payload)) return undefined;
+	const sessionId = getSessionId(args.ctx);
+	if (pending.sessionId && pending.sessionId !== sessionId) {
+		pendingPiCompactionNativeWindow = undefined;
+		return undefined;
+	}
+	if (!isPiCompactionSummarizationPayload(args.payload)) return undefined;
+	if (pending.provider !== args.runtime.provider || pending.api !== args.runtime.api || pending.baseUrl !== args.runtime.baseUrl) {
+		pendingPiCompactionNativeWindow = undefined;
+		return undefined;
+	}
+
+	const input = [...args.payload.input];
+	let insertAt = 0;
+	while (insertAt < input.length) {
+		const item = input[insertAt];
+		if (!isRecord(item) || (item.role !== "system" && item.role !== "developer")) break;
+		insertAt++;
+	}
+
+	pendingPiCompactionNativeWindow = undefined;
+	return {
+		...args.payload,
+		input: [
+			...input.slice(0, insertAt),
+			...pending.window.map((item) => structuredClone(item)),
+			...input.slice(insertAt),
+		],
+	};
 }
 
 function buildRequestTemplateIdentity(
@@ -230,6 +339,11 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 	});
 
 	if (compactResult.ok === false) {
+		const stashed = compactResult.reason !== "aborted" && stashLatestNativeWindowForPiCompactionFallback({
+			ctx: piContext,
+			branchEntries,
+			runtime,
+		});
 		writeDebugArtifact(
 			"compaction-event",
 			{
@@ -237,11 +351,31 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 				reason: compactResult.reason,
 				status: compactResult.status,
 				errorMessage: compactResult.errorMessage,
+				pendingPiFallbackNativeWindow: stashed,
 			},
 			settings,
 			piContext,
 		);
 		return compactResult.reason === "aborted" ? { cancel: true } : undefined;
+	}
+
+	const compactedWindow = sanitizeCompactedWindow(compactResult.compactedWindow);
+	if (compactedWindow.length === 0) {
+		writeDebugArtifact(
+			"compaction-event",
+			{
+				event: "session_before_compact.invalid-native-output",
+				reason: "no-installable-compacted-items",
+				provider: runtime.provider,
+				api: runtime.api,
+				model: runtime.model,
+				baseUrl: runtime.baseUrl,
+				output: summarizeCompactionOutputForDiagnostics(compactResult.compactedWindow, compactedWindow),
+			},
+			settings,
+			piContext,
+		);
+		return undefined;
 	}
 
 	let details: ReturnType<typeof createNativeCompactionDetails>;
@@ -251,7 +385,7 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 			api: runtime.api,
 			model: runtime.model,
 			baseUrl: runtime.baseUrl,
-			compactedWindow: compactResult.compactedWindow,
+			compactedWindow,
 			compactResponseId: compactResult.compactResponseId,
 			createdAt: compactResult.createdAt,
 			requestMeta: buildCompactionRequestMeta(event),
@@ -289,7 +423,7 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 			requestTemplateFields: requestTemplate ? Object.keys(requestTemplate.fields).sort() : [],
 			requestInputItems: compactRequest.input.length,
 			compactResponseId: compactResult.compactResponseId,
-			compactedItems: compactResult.compactedWindow.length,
+			compactedItems: compactedWindow.length,
 			firstKeptEntryId: event.preparation.firstKeptEntryId,
 		},
 		settings,
@@ -334,6 +468,9 @@ async function handleBeforeProviderRequest(event: BeforeProviderRequestEvent, ct
 	}
 
 	const runtime = resolution.runtime;
+	const piCompactionPayload = injectPendingNativeWindowIntoPiCompactionRequest({ payload: runtime.payload, ctx, runtime });
+	if (piCompactionPayload !== undefined) return piCompactionPayload;
+
 	const requestTemplateIdentity = buildRequestTemplateIdentity(runtime, ctx);
 	const requestTemplate = requestTemplateIdentity.sessionId
 		? createNativeCompactionRequestTemplate({
@@ -352,7 +489,17 @@ async function handleBeforeProviderRequest(event: BeforeProviderRequestEvent, ct
 		model: runtime.model,
 		baseUrl: runtime.baseUrl,
 	});
-	if (!latestNativeCompaction.ok) {
+	const latestNativeCompactionEntry = latestNativeCompaction.ok
+		? latestNativeCompaction.entry
+		: latestNativeCompaction.reason === "latest-compaction-not-native"
+			? findLatestNativeCompactionEntry(branchEntries, {
+				provider: runtime.provider,
+				api: runtime.api,
+				model: runtime.model,
+				baseUrl: runtime.baseUrl,
+			})
+			: undefined;
+	if (!latestNativeCompactionEntry) {
 		writeDebugArtifact(
 			"provider-request",
 			{
@@ -372,8 +519,6 @@ async function handleBeforeProviderRequest(event: BeforeProviderRequestEvent, ct
 		);
 		return undefined;
 	}
-
-	const latestNativeCompactionEntry = latestNativeCompaction.entry;
 	const rewrite = rewriteResponsesPayloadWithNativeReplay({
 		model: runtime.currentModel,
 		payload: runtime.payload,
@@ -461,4 +606,18 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_before_compact", handleSessionBeforeCompact);
 	pi.on("before_provider_request", handleBeforeProviderRequest);
+	pi.on("session_compact", async (event) => {
+		pendingPiCompactionNativeWindow = undefined;
+		if (!event.fromExtension || !isNativeCompactionDetails(event.compactionEntry.details)) return;
+		pi.sendMessage(
+			{
+				customType: NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE,
+				content: NATIVE_COMPACTION_DISPLAY_TEXT,
+				display: true,
+				details: { compactionEntryId: event.compactionEntry.id },
+			},
+			{ triggerTurn: false },
+		);
+	});
+	pi.on("context", async (event) => ({ messages: event.messages.filter((message) => !isNativeCompactionDisplayMessage(message)) }));
 }

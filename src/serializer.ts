@@ -360,8 +360,13 @@ function serializeUserContentItem<TApi extends Api>(
 	];
 }
 
+function isNativeImageGenerationBlock(block: AssistantMessage["content"][number]): block is AssistantMessage["content"][number] & { item: ResponsesInputItem } {
+	return typeof block === "object" && block !== null && "type" in block && block.type === "image_generation_call" && "item" in block;
+}
+
 function serializeAssistantMessage(message: AssistantMessage, messageIndex: number): ResponsesInputItem[] {
 	const items: ResponsesInputItem[] = [];
+	let textIndex = 0;
 
 	for (const block of message.content) {
 		if (block.type === "thinking") {
@@ -379,9 +384,15 @@ function serializeAssistantMessage(message: AssistantMessage, messageIndex: numb
 				role: "assistant",
 				content: [{ type: "output_text", text: sanitizeSurrogates(block.text), annotations: [] }],
 				status: "completed",
-				id: normalizeAssistantMessageId(signature?.id, messageIndex),
+				id: normalizeAssistantMessageId(signature?.id, messageIndex, textIndex),
 				phase: signature?.phase,
 			});
+			textIndex++;
+			continue;
+		}
+
+		if (isNativeImageGenerationBlock(block)) {
+			items.push(block.item);
 			continue;
 		}
 
@@ -491,9 +502,9 @@ function parseTextSignature(signature: string | undefined): ParsedTextSignature 
 	}
 }
 
-function normalizeAssistantMessageId(id: string | undefined, messageIndex: number): string {
+function normalizeAssistantMessageId(id: string | undefined, messageIndex: number, textIndex = 0): string {
 	if (!id) {
-		return `msg_${messageIndex}`;
+		return `msg_${messageIndex}_${textIndex}`;
 	}
 
 	if (id.length <= 64) {

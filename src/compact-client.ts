@@ -127,6 +127,12 @@ function normalizeHeaderValue(value: string | undefined): string | undefined {
 	return normalized ? normalized : undefined;
 }
 
+function extractBearerToken(headers: Headers): string | undefined {
+	const authorization = headers.get("authorization")?.trim();
+	const match = authorization?.match(/^Bearer\s+(.+)$/i);
+	return match?.[1]?.trim() || undefined;
+}
+
 function toHeaders(
 	runtime: NativeCompactionRuntime,
 	requestContext: Pick<ExecuteNativeCompactionOptions, "sessionId" | "clientRequestId"> = {},
@@ -137,7 +143,7 @@ function toHeaders(
 	}
 	headers.set("accept", JSON_CONTENT_TYPE);
 	headers.set("content-type", JSON_CONTENT_TYPE);
-	if (!headers.has("authorization")) {
+	if (runtime.apiKey) {
 		headers.set("authorization", `Bearer ${runtime.apiKey}`);
 	}
 
@@ -152,7 +158,7 @@ function toHeaders(
 	}
 
 	if (runtime.provider === "openai-codex") {
-		const accountId = extractCodexAccountId(runtime.apiKey);
+		const accountId = extractCodexAccountId(runtime.apiKey ?? extractBearerToken(headers) ?? "");
 		if (accountId) {
 			headers.set("chatgpt-account-id", accountId);
 		}

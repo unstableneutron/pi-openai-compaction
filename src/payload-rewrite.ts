@@ -7,7 +7,7 @@ import type {
 	SessionMessageEntry,
 } from "@mariozechner/pi-coding-agent";
 import type { ResponsesCompatibleRequestPayload } from "./runtime";
-import type { NativeCompactionEntry } from "./types";
+import { NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE, type NativeCompactionEntry } from "./types";
 import {
 	compareResponsesInputParity,
 	serializeMessagesToResponsesInput,
@@ -69,6 +69,19 @@ export type NativeReplayPayloadRewriteFailure = {
 export type NativeReplayPayloadRewriteResult =
 	| NativeReplayPayloadRewrite
 	| NativeReplayPayloadRewriteFailure;
+
+type ReplayMessageSet = {
+	messages: AgentMessage[];
+	input: ResponsesInputItem[];
+};
+
+type ReplayMatch = {
+	originalPiReplayInput: ResponsesInputItem[];
+	preCompactionKept: ReplayMessageSet;
+	postCompactionTail: ReplayMessageSet;
+	actualPostCompactionTail: ResponsesInputItem[];
+	extraPostCompactionTail: ResponsesInputItem[];
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
@@ -194,20 +207,6 @@ function cloneResponsesInputSlice(items: readonly unknown[]): ResponsesInputItem
 	return cloned;
 }
 
-function startsWithEquivalentValues(values: readonly unknown[], prefix: readonly unknown[]): boolean {
-	if (values.length < prefix.length) {
-		return false;
-	}
-
-	for (let index = 0; index < prefix.length; index++) {
-		if (!areEquivalentValues(values[index], prefix[index])) {
-			return false;
-		}
-	}
-
-	return true;
-}
-
 function areEquivalentValues(left: unknown, right: unknown): boolean {
 	if (Object.is(left, right)) {
 		return true;
@@ -274,12 +273,17 @@ function toSessionMessage(entry: SessionMessageEntry): AgentMessage {
 	return entry.message;
 }
 
+function isNativeCompactionDisplayCustomMessageEntry(entry: CustomMessageEntry): boolean {
+	return entry.customType === NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE;
+}
+
 function toReplayAgentMessage(entry: SessionEntry): AgentMessage | undefined {
 	if (entry.type === "message") {
 		return toSessionMessage(entry);
 	}
 
 	if (entry.type === "custom_message") {
+		if (isNativeCompactionDisplayCustomMessageEntry(entry)) return undefined;
 		return toCustomMessage(entry);
 	}
 
@@ -364,6 +368,105 @@ function createReplaySlice(
 	};
 }
 
+function createReplayMessageSet<TApi extends Api>(model: Model<TApi>, messages: AgentMessage[]): ReplayMessageSet {
+	return {
+		messages,
+		input: serializeMessagesToResponsesInput(model, messages),
+	};
+}
+
+function createReplayVariants<TApi extends Api>(args: {
+	model: Model<TApi>;
+	entries: readonly SessionEntry[];
+}): ReplayMessageSet[] {
+	return [createReplayMessageSet(args.model, collectReplayMessages(args.entries))];
+}
+
+function clonePayloadConversationInput(args: {
+	payloadInput: readonly unknown[];
+	freshPreamble: FreshAuthoritativePreamble;
+}): ResponsesInputItem[] | undefined {
+	const tailEndIndex = args.payloadInput.length - args.freshPreamble.trailingInput.length;
+	if (tailEndIndex < args.freshPreamble.leadingInput.length) return undefined;
+	return cloneResponsesInputSlice(args.payloadInput.slice(args.freshPreamble.leadingInput.length, tailEndIndex));
+}
+
+function stripLeadingCompactionSummaryPlaceholder(args: {
+	conversationInput: readonly ResponsesInputItem[];
+	compactionSummaryInput: readonly ResponsesInputItem[];
+}): ResponsesInputItem[] {
+	if (args.compactionSummaryInput.length === 0) return [...args.conversationInput];
+	if (!areEquivalentValues(args.conversationInput.slice(0, args.compactionSummaryInput.length), args.compactionSummaryInput)) {
+		return [...args.conversationInput];
+	}
+	return [...args.conversationInput.slice(args.compactionSummaryInput.length)];
+}
+
+function buildLenientNativeReplayPayload(args: {
+	payload: ResponsesCompatibleRequestPayload;
+	freshPreamble: FreshAuthoritativePreamble;
+	compactedWindow: readonly unknown[];
+	compactionSummaryInput: readonly ResponsesInputItem[];
+}): { input: unknown[]; conversationInput: ResponsesInputItem[] } | undefined {
+	const conversationInput = clonePayloadConversationInput({ payloadInput: args.payload.input, freshPreamble: args.freshPreamble });
+	if (!conversationInput) return undefined;
+	const replayConversationInput = stripLeadingCompactionSummaryPlaceholder({ conversationInput, compactionSummaryInput: args.compactionSummaryInput });
+	return {
+		conversationInput: replayConversationInput,
+		input: [
+			...args.freshPreamble.leadingInput,
+			...args.compactedWindow,
+			...replayConversationInput,
+			...args.freshPreamble.trailingInput,
+		],
+	};
+}
+
+function findReplayMatch<TApi extends Api>(args: {
+	model: Model<TApi>;
+	payloadInput: readonly unknown[];
+	freshPreamble: FreshAuthoritativePreamble;
+	compactionSummaryMessage: AgentMessage;
+	preCompactionEntries: readonly SessionEntry[];
+	postCompactionEntries: readonly SessionEntry[];
+}): ReplayMatch | undefined {
+	const compactionSummaryInput = serializeMessagesToResponsesInput(args.model, [args.compactionSummaryMessage]);
+	const preCompactionVariants = [
+		...createReplayVariants({ model: args.model, entries: args.preCompactionEntries }),
+		createReplayMessageSet(args.model, []),
+	];
+	const postCompactionVariants = createReplayVariants({ model: args.model, entries: args.postCompactionEntries });
+
+	for (const preCompactionKept of preCompactionVariants) {
+		for (const postCompactionTail of postCompactionVariants) {
+			const expectedBeforeTrailing: ResponsesInputItem[] = [
+				...args.freshPreamble.leadingInput,
+				...compactionSummaryInput,
+				...preCompactionKept.input,
+				...postCompactionTail.input,
+			];
+			const originalPiReplayInput: ResponsesInputItem[] = [...expectedBeforeTrailing, ...args.freshPreamble.trailingInput];
+			const tailEndIndex = args.payloadInput.length - args.freshPreamble.trailingInput.length;
+			const prefixMatches = areEquivalentValues(args.payloadInput.slice(0, expectedBeforeTrailing.length), expectedBeforeTrailing);
+			const trailingMatches = areEquivalentValues(args.payloadInput.slice(tailEndIndex), args.freshPreamble.trailingInput);
+
+			if (prefixMatches && trailingMatches && tailEndIndex >= expectedBeforeTrailing.length) {
+				const actualPostCompactionTail = cloneResponsesInputSlice(
+					args.payloadInput.slice(
+						args.freshPreamble.leadingInput.length + compactionSummaryInput.length + preCompactionKept.input.length,
+						tailEndIndex,
+					),
+				);
+				const extraPostCompactionTail = cloneResponsesInputSlice(args.payloadInput.slice(expectedBeforeTrailing.length, tailEndIndex));
+				if (!actualPostCompactionTail || !extraPostCompactionTail) return undefined;
+				return { originalPiReplayInput, preCompactionKept, postCompactionTail, actualPostCompactionTail, extraPostCompactionTail };
+			}
+		}
+	}
+
+	return undefined;
+}
+
 function findEntryIndexByIdBeforeBoundary(
 	entries: readonly SessionEntry[],
 	entryId: string,
@@ -438,16 +541,6 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		};
 	}
 
-	const newerCompactionEntry = args.branchEntries
-		.slice(boundaryIndex + 1)
-		.some((entry) => entry.type === "compaction");
-	if (newerCompactionEntry) {
-		return {
-			ok: false,
-			reason: "unexpected-compaction-after-boundary",
-		};
-	}
-
 	const compactedWindow = normalizeNativeCompactedWindowForReplay(args.compactionEntry.details.compactedWindow);
 	if (!compactedWindow) {
 		return {
@@ -456,33 +549,97 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		};
 	}
 
+	const newerCompactionEntry = args.branchEntries
+		.slice(boundaryIndex + 1)
+		.some((entry) => entry.type === "compaction");
+	if (newerCompactionEntry) {
+		const freshPreamble = extractFreshAuthoritativePreamble(args.payload);
+		if (!freshPreamble) {
+			return {
+				ok: false,
+				reason: "unsupported-instructions",
+			};
+		}
+		const compactionSummaryInput = serializeMessagesToResponsesInput(args.model, [createCompactionSummaryAgentMessage(args.compactionEntry)]);
+		const lenientReplay = buildLenientNativeReplayPayload({ payload: args.payload, freshPreamble, compactedWindow, compactionSummaryInput });
+		const originalPiReplayInput = cloneResponsesInputSlice(args.payload.input);
+		if (!lenientReplay || !originalPiReplayInput) {
+			return {
+				ok: false,
+				reason: "unexpected-compaction-after-boundary",
+			};
+		}
+
+		return {
+			ok: true,
+			segments: {
+				boundaryIndex,
+				firstKeptEntryIndex,
+				instructions: freshPreamble.instructions,
+				freshPreamble: freshPreamble.leadingInput,
+				trailingPreamble: freshPreamble.trailingInput,
+				compactionSummary: [],
+				preCompactionKeptWindow: createReplaySlice([], [], []),
+				compactedWindow,
+				postCompactionTail: createReplaySlice(args.branchEntries.slice(boundaryIndex + 1), [], lenientReplay.conversationInput),
+				originalPiReplayInput,
+				replayInput: lenientReplay.input,
+			},
+			rewrittenPayload: {
+				...args.payload,
+				...(freshPreamble.instructions !== undefined ? { instructions: freshPreamble.instructions } : {}),
+				input: lenientReplay.input,
+			},
+		};
+	}
+
 	const preCompactionEntries = args.branchEntries.slice(firstKeptEntryIndex, boundaryIndex);
 	const postCompactionEntries = args.branchEntries.slice(boundaryIndex + 1);
-	const preCompactionKeptMessages = collectReplayMessages(preCompactionEntries);
-	const postCompactionTailMessages = collectReplayMessages(postCompactionEntries);
+	const contextPostCompactionTailMessages = collectReplayMessages(postCompactionEntries);
 	const compactionSummaryMessage = createCompactionSummaryAgentMessage(args.compactionEntry);
-	const serializedPiHistoryInput = serializeMessagesToResponsesInput(args.model, [
+	const replayMatch = findReplayMatch({
+		model: args.model,
+		payloadInput: args.payload.input,
+		freshPreamble,
 		compactionSummaryMessage,
-		...preCompactionKeptMessages,
-		...postCompactionTailMessages,
-	]);
-	const expectedPersistedPiReplayInput: ResponsesInputItem[] = [
-		...freshPreamble.leadingInput,
-		...serializedPiHistoryInput,
-		...freshPreamble.trailingInput,
-	];
+		preCompactionEntries,
+		postCompactionEntries,
+	});
 
-	const freshPreambleCount = freshPreamble.leadingInput.length;
-	const trailingPreambleCount = freshPreamble.trailingInput.length;
-	const replayTailEndIndex = args.payload.input.length - trailingPreambleCount;
-	const actualReplayCoreInput = args.payload.input.slice(freshPreambleCount, replayTailEndIndex);
-	const replayShapeMatches =
-		replayTailEndIndex >= freshPreambleCount &&
-		areEquivalentValues(args.payload.input.slice(0, freshPreambleCount), freshPreamble.leadingInput) &&
-		startsWithEquivalentValues(actualReplayCoreInput, serializedPiHistoryInput) &&
-		areEquivalentValues(args.payload.input.slice(replayTailEndIndex), freshPreamble.trailingInput);
-	if (!replayShapeMatches) {
-		const parity = compareResponsesInputParity(args.payload.input, expectedPersistedPiReplayInput);
+	if (!replayMatch) {
+		const compactionSummaryInput = serializeMessagesToResponsesInput(args.model, [compactionSummaryMessage]);
+		const lenientReplay = buildLenientNativeReplayPayload({ payload: args.payload, freshPreamble, compactedWindow, compactionSummaryInput });
+		if (lenientReplay) {
+			return {
+				ok: true,
+				segments: {
+					boundaryIndex,
+					firstKeptEntryIndex,
+					instructions: freshPreamble.instructions,
+					freshPreamble: freshPreamble.leadingInput,
+					trailingPreamble: freshPreamble.trailingInput,
+					compactionSummary: compactionSummaryInput,
+					preCompactionKeptWindow: createReplaySlice(preCompactionEntries, [], []),
+					compactedWindow,
+					postCompactionTail: createReplaySlice(postCompactionEntries, [], lenientReplay.conversationInput),
+					originalPiReplayInput: cloneResponsesInputSlice(args.payload.input) ?? [],
+					replayInput: lenientReplay.input,
+				},
+				rewrittenPayload: {
+					...args.payload,
+					...(freshPreamble.instructions !== undefined ? { instructions: freshPreamble.instructions } : {}),
+					input: lenientReplay.input,
+				},
+			};
+		}
+		const expectedInput = [
+			...freshPreamble.leadingInput,
+			...compactionSummaryInput,
+			...serializeMessagesToResponsesInput(args.model, collectReplayMessages(preCompactionEntries)),
+			...serializeMessagesToResponsesInput(args.model, collectReplayMessages(postCompactionEntries)),
+			...freshPreamble.trailingInput,
+		];
+		const parity = compareResponsesInputParity(args.payload.input, expectedInput);
 		return {
 			ok: false,
 			reason: "expected-pi-replay-mismatch",
@@ -494,16 +651,10 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 		};
 	}
 
-	const originalPiReplayInput = cloneResponsesInputSlice(args.payload.input);
-	if (!originalPiReplayInput) {
-		return {
-			ok: false,
-			reason: "expected-pi-replay-mismatch",
-		};
-	}
+	const freshPreambleCount = freshPreamble.leadingInput.length;
+	const trailingPreambleCount = freshPreamble.trailingInput.length;
 	const compactionSummaryCount = serializeMessagesToResponsesInput(args.model, [compactionSummaryMessage]).length;
-	const preCompactionKeptCount = serializeMessagesToResponsesInput(args.model, preCompactionKeptMessages).length;
-	const tailStartIndex = freshPreambleCount + compactionSummaryCount + preCompactionKeptCount;
+	const preCompactionKeptCount = replayMatch.preCompactionKept.input.length;
 	const tailEndIndex = args.payload.input.length - trailingPreambleCount;
 	const actualCompactionSummary = cloneResponsesInputSlice(
 		args.payload.input.slice(freshPreambleCount, freshPreambleCount + compactionSummaryCount),
@@ -514,7 +665,11 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 			freshPreambleCount + compactionSummaryCount + preCompactionKeptCount,
 		),
 	);
-	const actualPostCompactionTail = cloneResponsesInputSlice(args.payload.input.slice(tailStartIndex, tailEndIndex));
+	const actualPostCompactionTail = replayMatch.actualPostCompactionTail;
+	const contextPostCompactionTail = [
+		...serializeMessagesToResponsesInput(args.model, contextPostCompactionTailMessages),
+		...replayMatch.extraPostCompactionTail,
+	];
 	if (!actualCompactionSummary || !actualPreCompactionKeptWindow || !actualPostCompactionTail) {
 		return {
 			ok: false,
@@ -524,13 +679,13 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 
 	const preCompactionKeptWindow = createReplaySlice(
 		preCompactionEntries,
-		preCompactionKeptMessages,
+		replayMatch.preCompactionKept.messages,
 		actualPreCompactionKeptWindow,
 	);
 	const postCompactionTail = createReplaySlice(
 		postCompactionEntries,
-		postCompactionTailMessages,
-		actualPostCompactionTail,
+		contextPostCompactionTailMessages,
+		contextPostCompactionTail,
 	);
 
 	return {
@@ -545,11 +700,11 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 			preCompactionKeptWindow,
 			compactedWindow,
 			postCompactionTail,
-			originalPiReplayInput,
+			originalPiReplayInput: replayMatch.originalPiReplayInput,
 			replayInput: [
 				...freshPreamble.leadingInput,
 				...compactedWindow,
-				...actualPostCompactionTail,
+				...contextPostCompactionTail,
 				...freshPreamble.trailingInput,
 			],
 		},
@@ -559,7 +714,7 @@ function buildNativeReplaySegmentsInternal<TApi extends Api>(args: {
 			input: [
 				...freshPreamble.leadingInput,
 				...compactedWindow,
-				...actualPostCompactionTail,
+				...contextPostCompactionTail,
 				...freshPreamble.trailingInput,
 			],
 		},

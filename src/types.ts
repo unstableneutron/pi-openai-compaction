@@ -9,6 +9,14 @@ export const DEFAULT_SUPPORTED_PROVIDERS = ["openai", "openai-codex"] as const;
 export const DEFAULT_SUPPORTED_APIS = ["openai-responses", "openai-codex-responses"] as const;
 export const NATIVE_COMPACTION_STRATEGY = "openai-native-compact-v1";
 export const NATIVE_COMPACTION_SHIM_SUMMARY = "[OpenAI native compaction checkpoint]";
+export const NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE = "openai-native-compaction-display";
+export const NATIVE_COMPACTION_DISPLAY_TEXT = [
+	"OpenAI native compaction was used for this checkpoint.",
+	"",
+	"The compaction result is opaque and may not be human-readable in Pi.",
+	"",
+	"Warning: do not turn native compaction off or switch providers mid-session; old context may be much less reliable.",
+].join("\n");
 
 export type DebugArtifactKind =
 	| "provider-request"

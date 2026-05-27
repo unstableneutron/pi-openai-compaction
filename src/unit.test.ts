@@ -5,7 +5,7 @@ import {
 	createNativeCompactionRequestTemplate,
 	isMatchingNativeCompactionRequestTemplate,
 } from "./request-template";
-import { buildCompactUrl } from "./runtime";
+import { buildCompactUrl, resolveNativeCompactionEnvironment } from "./runtime";
 
 const baseModel = {
 	provider: "openai",
@@ -192,6 +192,38 @@ test("request template matching protects live compact model input and instructio
 	});
 });
 
+test("resolveNativeCompactionEnvironment accepts authorization header without apiKey", async () => {
+	const resolution = await resolveNativeCompactionEnvironment({
+		model: {
+			provider: "openai",
+			api: "openai-responses",
+			id: "gpt-5-mini",
+			baseUrl: "https://api.openai.com/v1",
+		},
+		modelRegistry: {
+			async getApiKeyAndHeaders() {
+				return {
+					ok: true,
+					apiKey: undefined,
+					headers: { authorization: "Bearer header-token" },
+				};
+			},
+		},
+	} as never);
+
+	expect(resolution).toEqual({
+		ok: true,
+		runtime: expect.objectContaining({
+			provider: "openai",
+			api: "openai-responses",
+			model: "gpt-5-mini",
+			baseUrl: "https://api.openai.com/v1",
+			apiKey: undefined,
+			headers: { authorization: "Bearer header-token" },
+		}),
+	});
+});
+
 test("executeNativeCompaction propagates resolved request headers and codex auth headers", async () => {
 	const token = createJwtWithAccountId("acct_123");
 	let fetchArgs: { url?: string; init?: RequestInit } = {};
@@ -247,6 +279,47 @@ test("executeNativeCompaction propagates resolved request headers and codex auth
 	expect(headers.get("session_id")).toBe("session-compact-123");
 	expect(headers.get("x-client-request-id")).toBe("request-compact-456");
 	expect(headers.get("content-type")).toBe("application/json");
+});
+
+test("serializer gives multiple unsigned assistant text blocks unique fallback ids", async () => {
+	const { serializeMessagesToResponsesInput } = await loadSerializerModule();
+	const input = serializeMessagesToResponsesInput(baseModel as never, [
+		{
+			role: "assistant",
+			provider: baseModel.provider,
+			api: baseModel.api,
+			model: baseModel.id,
+			stopReason: "stop",
+			content: [
+				{ type: "text", text: "one" },
+				{ type: "text", text: "two" },
+			],
+			timestamp: 2,
+		},
+	] as never);
+
+	expect(input.map((item) => (item as { id?: string }).id)).toEqual(["msg_0_0", "msg_0_1"]);
+});
+
+test("serializer preserves native image generation output items", async () => {
+	const { serializeMessagesToResponsesInput } = await loadSerializerModule();
+	const imageCall = {
+		type: "image_generation_call",
+		item: { type: "image_generation_call", id: "ig_1", status: "completed", result: null },
+	};
+	const input = serializeMessagesToResponsesInput(baseModel as never, [
+		{
+			role: "assistant",
+			provider: baseModel.provider,
+			api: baseModel.api,
+			model: baseModel.id,
+			stopReason: "stop",
+			content: [imageCall],
+			timestamp: 2,
+		},
+	] as never);
+
+	expect(input).toEqual([imageCall.item]);
 });
 
 test("serializer sanitizes unpaired surrogates in instructions and message content", async () => {
