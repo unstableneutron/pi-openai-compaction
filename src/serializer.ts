@@ -118,13 +118,27 @@ type ParsedTextSignature = {
 };
 
 const SYNTHETIC_TOOL_RESULT_TEXT = "No result provided";
+const TRANSIENT_GOAL_CUSTOM_TYPES = new Set(["goal-continuation", "goal-ui"]);
 
 function sanitizeSurrogates(text: string): string {
 	return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
 }
 
+function isTransientGoalCustomMessage(message: AgentMessage): boolean {
+	return Boolean(
+		(message as { role?: unknown }).role === "custom" &&
+			TRANSIENT_GOAL_CUSTOM_TYPES.has(String((message as { customType?: unknown }).customType ?? "")),
+	);
+}
+
+export function filterTransientGoalCustomMessages<TMessage extends AgentMessage>(
+	messages: readonly TMessage[],
+): TMessage[] {
+	return messages.filter((message) => !isTransientGoalCustomMessage(message));
+}
+
 export function collectCompactionWindowMessages(preparation: CompactionPreparation): AgentMessage[] {
-	return [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
+	return filterTransientGoalCustomMessages([...preparation.messagesToSummarize, ...preparation.turnPrefixMessages]);
 }
 
 export function serializeCompactionPreparationToRequest<TApi extends Api>(args: {
@@ -156,7 +170,7 @@ export function serializeMessagesToResponsesInput<TApi extends Api>(
 	messages: AgentMessage[],
 	options: SerializeResponsesMessagesOptions = {},
 ): ResponsesInputItem[] {
-	const llmMessages = convertToLlm(messages);
+	const llmMessages = convertToLlm(filterTransientGoalCustomMessages(messages));
 	const transformedMessages = transformMessagesForResponses(llmMessages);
 	const input: ResponsesInputItem[] = [];
 

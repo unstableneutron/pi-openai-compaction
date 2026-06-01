@@ -29,6 +29,13 @@ async function loadSerializerModule() {
 	return import(`./serializer.ts?unit=${serializerImportCounter++}`);
 }
 
+async function loadPayloadRewriteModule() {
+	mock.module("@mariozechner/pi-coding-agent", () => ({
+		convertToLlm: (messages: unknown[]) => messages,
+	}));
+	return import(`./payload-rewrite.ts?unit=${serializerImportCounter++}`);
+}
+
 function createJwtWithAccountId(accountId: string): string {
 	const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
 	const payload = Buffer.from(
@@ -279,6 +286,61 @@ test("executeNativeCompaction propagates resolved request headers and codex auth
 	expect(headers.get("session_id")).toBe("session-compact-123");
 	expect(headers.get("x-client-request-id")).toBe("request-compact-456");
 	expect(headers.get("content-type")).toBe("application/json");
+});
+
+test("compaction window drops transient goal continuation and UI custom messages", async () => {
+	const { collectCompactionWindowMessages } = await loadSerializerModule();
+	const messages = collectCompactionWindowMessages({
+		messagesToSummarize: [
+			{ role: "user", content: [{ type: "text", text: "keep me" }], timestamp: 1 },
+			{ role: "custom", customType: "goal-continuation", content: "drop me", display: false, timestamp: 2 },
+		],
+		turnPrefixMessages: [
+			{ role: "custom", customType: "goal-ui", content: "drop me too", display: true, timestamp: 3 },
+			{ role: "custom", customType: "other-extension", content: "keep custom", display: false, timestamp: 4 },
+		],
+	} as never);
+
+	expect(messages.map((message) => (message as { role?: string; customType?: string }).customType ?? message.role)).toEqual([
+		"user",
+		"other-extension",
+	]);
+});
+
+test("native replay live tail drops transient goal continuation and UI custom entries", async () => {
+	const { collectLiveTailMessages } = await loadPayloadRewriteModule();
+	const messages = collectLiveTailMessages([
+		{ type: "message", id: "user-1", timestamp: "2026-01-01T00:00:00.000Z", message: { role: "user", content: "keep" } },
+		{
+			type: "custom_message",
+			id: "goal-1",
+			timestamp: "2026-01-01T00:00:01.000Z",
+			customType: "goal-continuation",
+			content: "drop",
+			display: false,
+		},
+		{
+			type: "custom_message",
+			id: "goal-ui-1",
+			timestamp: "2026-01-01T00:00:02.000Z",
+			customType: "goal-ui",
+			content: "drop",
+			display: true,
+		},
+		{
+			type: "custom_message",
+			id: "other-1",
+			timestamp: "2026-01-01T00:00:03.000Z",
+			customType: "other-extension",
+			content: "keep",
+			display: false,
+		},
+	] as never);
+
+	expect(messages.map((message) => (message as { role?: string; customType?: string }).customType ?? message.role)).toEqual([
+		"user",
+		"other-extension",
+	]);
 });
 
 test("serializer gives multiple unsigned assistant text blocks unique fallback ids", async () => {

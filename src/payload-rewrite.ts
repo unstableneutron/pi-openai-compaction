@@ -10,6 +10,7 @@ import type { ResponsesCompatibleRequestPayload } from "./runtime";
 import { NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE, type NativeCompactionEntry } from "./types";
 import {
 	compareResponsesInputParity,
+	filterTransientGoalCustomMessages,
 	serializeMessagesToResponsesInput,
 	type ResponsesInputContentItem,
 	type ResponsesInputItem,
@@ -344,7 +345,7 @@ function collectReplayMessages(entries: readonly SessionEntry[]): AgentMessage[]
 		}
 	}
 
-	return messages;
+	return filterTransientGoalCustomMessages(messages);
 }
 
 function createCompactionSummaryAgentMessage(entry: NativeCompactionEntry): AgentMessage {
