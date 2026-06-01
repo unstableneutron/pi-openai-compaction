@@ -724,7 +724,7 @@ test("repeated native compaction reuses the latest stored compacted window inste
 	expect(JSON.stringify(compactRequest.input)).not.toContain("Original context before native compaction.");
 });
 
-test("session_before_compact fails open when the latest compaction is not native", async () => {
+test("session_before_compact converts a latest non-native compaction using filtered session context", async () => {
 	const { sessionBeforeCompact, compactCalls } = await loadHookHarness();
 	const model = { ...defaultModel };
 	const olderUser = createUserEntry("older_non_native_user", "Context from before a non-native compaction.");
@@ -737,6 +737,13 @@ test("session_before_compact fails open when the latest compaction is not native
 		tokensBefore: 512,
 	};
 	const currentUser = createUserEntry("current_after_non_native", "Current context after a non-native compaction.");
+	const goalContinuation = {
+		role: "custom",
+		customType: "goal-continuation",
+		content: "This repeated hidden goal prompt must not enter native compaction.",
+		display: false,
+		timestamp: Date.now(),
+	};
 	const event = {
 		signal: new AbortController().signal,
 		customInstructions: undefined,
@@ -758,13 +765,19 @@ test("session_before_compact fails open when the latest compaction is not native
 			sessionContextMessages: [
 				createCompactionSummaryMessage(nonNativeCompaction),
 				toReplayMessage(olderUser),
+				goalContinuation,
 				toReplayMessage(currentUser),
 			],
 		}),
 	);
 
-	expect(result).toBeUndefined();
-	expect(compactCalls).toHaveLength(0);
+	expect(result).toEqual({ compaction: expect.objectContaining({ firstKeptEntryId: currentUser.id }) });
+	expect(compactCalls).toHaveLength(1);
+	const compactRequest = compactCalls[0]?.request as { instructions: string; input: unknown[] };
+	expect(compactRequest.instructions).toBe("Current instructions after a non-native compaction");
+	expect(JSON.stringify(compactRequest.input)).toContain("Legacy Pi summary");
+	expect(JSON.stringify(compactRequest.input)).toContain("Current context after a non-native compaction.");
+	expect(JSON.stringify(compactRequest.input)).not.toContain("repeated hidden goal prompt");
 });
 
 test("first post-compaction turn rewrites to fresh preamble + opaque compacted window + live tail without duplication", async () => {

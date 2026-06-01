@@ -265,7 +265,7 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 		baseUrl: runtime.baseUrl,
 	});
 
-	let requestSource: "session-context" | "latest-native-replay";
+	let requestSource: "session-context" | "latest-native-replay" | "non-native-compaction-context";
 	let request = undefined as ReturnType<typeof serializeMessagesToCompactRequest> | undefined;
 	if (latestNativeCompaction.ok) {
 		const compactedWindow = normalizeNativeCompactedWindowForReplay(latestNativeCompaction.entry.details.compactedWindow);
@@ -297,30 +297,13 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 			],
 			instructions,
 		};
-	} else if (latestNativeCompaction.reason === "no-compaction") {
-		requestSource = "session-context";
+	} else {
+		requestSource = latestNativeCompaction.reason === "no-compaction" ? "session-context" : "non-native-compaction-context";
 		request = serializeMessagesToCompactRequest({
 			model: runtime.currentModel,
 			messages: piContext.sessionManager.buildSessionContext().messages,
 			instructions,
 		});
-	} else {
-		writeDebugArtifact(
-			"compaction-event",
-			{
-				event: "session_before_compact.skip",
-				reason: latestNativeCompaction.reason,
-				provider: runtime.provider,
-				api: runtime.api,
-				model: runtime.model,
-				baseUrl: runtime.baseUrl,
-				latestCompactionIndex: latestNativeCompaction.latestCompactionIndex,
-				latestCompactionIdentity: getCompactionIdentityDebugInfo(latestNativeCompaction.latestCompaction),
-			},
-			settings,
-			piContext,
-		);
-		return undefined;
 	}
 
 	const requestTemplateIdentity = buildRequestTemplateIdentity(runtime, piContext);
