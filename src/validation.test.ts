@@ -2,6 +2,7 @@ import { afterEach, expect, mock, test } from "bun:test";
 import {
 	DEFAULT_EXTENSION_SETTINGS,
 	NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE,
+	NATIVE_COMPACTION_DISPLAY_TEXT,
 	NATIVE_COMPACTION_SHIM_SUMMARY,
 	createNativeCompactionDetails,
 	type ExtensionSettings,
@@ -306,7 +307,9 @@ async function buildPiReplayPayload(args: {
 
 function createContext(args: {
 	branchEntries?: TestSessionEntry[];
+	hasUI?: boolean;
 	model?: TestModel;
+	notifications?: Array<{ message: string; level: string }>;
 	systemPrompt?: string;
 	sessionContextMessages?: Record<string, unknown>[];
 } = {}) {
@@ -316,7 +319,12 @@ function createContext(args: {
 		args.sessionContextMessages ?? branchEntries.filter((entry) => entry.type === "message").map(toReplayMessage);
 	return {
 		cwd: "/tmp/openai-native-compaction-validation",
-		hasUI: false,
+		hasUI: args.hasUI ?? false,
+		ui: {
+			notify: (message: string, level: string) => {
+				args.notifications?.push({ message, level });
+			},
+		},
 		getSystemPrompt: () => args.systemPrompt ?? "Current instructions v1",
 		model,
 		modelRegistry: {
@@ -1292,9 +1300,10 @@ test("a second compaction replays only the latest compacted window and keeps fre
 	expect(JSON.stringify(rewritten.input)).not.toContain("Interim question between compactions.");
 });
 
-test("native compaction emits a display marker and filters it from context", async () => {
+test("native compaction notifies without appending a display marker and filters legacy markers from context", async () => {
 	const { sessionCompact, context, sentMessages } = await loadHookHarness();
 	if (!sessionCompact || !context) throw new Error("Expected session_compact and context hooks");
+	const notifications: Array<{ message: string; level: string }> = [];
 	const model = { ...defaultModel };
 	const user = createUserEntry("display_marker_user", "Context before native compaction marker.");
 	const compactionEntry = createCompactionEntry({
@@ -1304,11 +1313,10 @@ test("native compaction emits a display marker and filters it from context", asy
 		compactedWindow: [{ type: "compaction", encrypted_content: "opaque-display-marker" }],
 	});
 
-	await sessionCompact({ fromExtension: true, compactionEntry }, createContext({ model }));
+	await sessionCompact({ fromExtension: true, compactionEntry }, createContext({ hasUI: true, model, notifications }));
 
-	expect(sentMessages).toHaveLength(1);
-	expect((sentMessages[0]?.message as { customType?: string }).customType).toBe(NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE);
-	expect(sentMessages[0]?.options).toEqual({ triggerTurn: false });
+	expect(sentMessages).toEqual([]);
+	expect(notifications).toEqual([{ message: NATIVE_COMPACTION_DISPLAY_TEXT, level: "warning" }]);
 	const filtered = await context(
 		{
 			messages: [
@@ -1319,6 +1327,26 @@ test("native compaction emits a display marker and filters it from context", asy
 		createContext({ model }),
 	) as { messages: unknown[] };
 	expect(filtered.messages).toEqual([{ role: "user", content: "keep me" }]);
+});
+
+
+test("headless native compaction does not append a display marker", async () => {
+	const { sessionCompact, sentMessages } = await loadHookHarness();
+	if (!sessionCompact) throw new Error("Expected session_compact hook");
+	const notifications: Array<{ message: string; level: string }> = [];
+	const model = { ...defaultModel };
+	const user = createUserEntry("headless_display_marker_user", "Context before native compaction marker.");
+	const compactionEntry = createCompactionEntry({
+		id: "headless_display_marker_compaction",
+		firstKeptEntryId: user.id,
+		model,
+		compactedWindow: [{ type: "compaction", encrypted_content: "opaque-headless-display-marker" }],
+	});
+
+	await sessionCompact({ fromExtension: true, compactionEntry }, createContext({ hasUI: false, model, notifications }));
+
+	expect(sentMessages).toEqual([]);
+	expect(notifications).toEqual([]);
 });
 
 test("unsupported model/provider switching fails open instead of replaying stale native state", async () => {

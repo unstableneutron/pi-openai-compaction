@@ -1,6 +1,6 @@
 {
   "name": "@jordyvd/pi-openai-compaction",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "type": "module",
   "description": "OpenAI native standalone compaction replay for Pi.",
   "author": "Jordy Van Domselaar",

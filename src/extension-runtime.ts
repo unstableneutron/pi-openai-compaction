@@ -589,18 +589,12 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_before_compact", handleSessionBeforeCompact);
 	pi.on("before_provider_request", handleBeforeProviderRequest);
-	pi.on("session_compact", async (event) => {
+	pi.on("session_compact", async (event, ctx) => {
 		pendingPiCompactionNativeWindow = undefined;
 		if (!event.fromExtension || !isNativeCompactionDetails(event.compactionEntry.details)) return;
-		pi.sendMessage(
-			{
-				customType: NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE,
-				content: NATIVE_COMPACTION_DISPLAY_TEXT,
-				display: true,
-				details: { compactionEntryId: event.compactionEntry.id },
-			},
-			{ triggerTurn: false },
-		);
+		if (ctx.hasUI) {
+			ctx.ui.notify(NATIVE_COMPACTION_DISPLAY_TEXT, "warning");
+		}
 	});
 	pi.on("context", async (event) => ({ messages: event.messages.filter((message) => !isNativeCompactionDisplayMessage(message)) }));
 }
