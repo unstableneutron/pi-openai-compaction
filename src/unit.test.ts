@@ -231,6 +231,28 @@ test("resolveNativeCompactionEnvironment accepts authorization header without ap
 	});
 });
 
+test("websocket responses api resolves to codex native compaction identity", async () => {
+	const model = {
+		...baseModel,
+		provider: "openai-codex",
+		api: "openai-websocket-responses",
+		id: "gpt-5.5-fast",
+		baseUrl: "https://chatgpt.com/backend-api",
+	};
+	const result = await resolveNativeCompactionEnvironment({
+		model,
+		modelRegistry: {
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "sk-test-native-compaction" }),
+		},
+	} as never);
+
+	expect(result.ok).toBe(true);
+	if (!result.ok) return;
+	expect(result.runtime.api).toBe("openai-codex-responses");
+	expect(result.runtime.apiFamily).toBe("openai-codex-responses");
+	expect(result.runtime.compactUrl).toBe("https://chatgpt.com/backend-api/codex/responses/compact");
+});
+
 test("executeNativeCompaction propagates resolved request headers and codex auth headers", async () => {
 	const token = createJwtWithAccountId("acct_123");
 	let fetchArgs: { url?: string; init?: RequestInit } = {};

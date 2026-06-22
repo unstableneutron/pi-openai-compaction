@@ -8,6 +8,7 @@ export {
 	isSupportedApi,
 	isSupportedProvider,
 	normalizeBaseUrl,
+	resolveResponsesApiFamily,
 	resolveNativeCompactionEnvironment,
 	type NativeCompactionEnvironmentFailure,
 	type NativeCompactionEnvironmentResolution,

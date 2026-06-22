@@ -130,6 +130,21 @@ export function isSupportedApi(api: string): api is DefaultSupportedApi {
 	return (DEFAULT_SUPPORTED_APIS as readonly string[]).includes(api);
 }
 
+export function resolveResponsesApiFamily(
+	api: string,
+	provider: string,
+): DefaultSupportedApi | undefined {
+	if (isSupportedApi(api)) {
+		return api;
+	}
+
+	if (api === "openai-websocket-responses") {
+		return provider === "openai-codex" ? "openai-codex-responses" : "openai-responses";
+	}
+
+	return undefined;
+}
+
 export function isResponsesCompatiblePayload(payload: unknown): payload is ResponsesCompatibleRequestPayload {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 		return false;
@@ -189,15 +204,8 @@ export async function resolveNativeCompactionEnvironment(
 	}
 
 	const supportedApis = normalizeConfiguredSet(options.supportedApis, DEFAULT_SUPPORTED_APIS);
-	if (!supportedApis.has(descriptor.api)) {
-		return {
-			ok: false,
-			reason: "unsupported-api",
-			...descriptor,
-		};
-	}
-
-	if (!isSupportedApi(descriptor.api)) {
+	const apiFamily = resolveResponsesApiFamily(descriptor.api, descriptor.provider);
+	if (!apiFamily || (!supportedApis.has(descriptor.api) && !supportedApis.has(apiFamily))) {
 		return {
 			ok: false,
 			reason: "unsupported-api",
@@ -250,14 +258,14 @@ export async function resolveNativeCompactionEnvironment(
 		ok: true,
 		runtime: {
 			provider: descriptor.provider,
-			api: descriptor.api,
-			apiFamily: descriptor.api,
+			api: apiFamily,
+			apiFamily,
 			model: descriptor.model,
 			baseUrl: descriptor.baseUrl,
 			apiKey,
 			headers,
-			compactPath: buildCompactPath(descriptor.api),
-			compactUrl: buildCompactUrl(descriptor.baseUrl, descriptor.api),
+			compactPath: buildCompactPath(apiFamily),
+			compactUrl: buildCompactUrl(descriptor.baseUrl, apiFamily),
 			payload: requestPayload,
 			currentModel,
 		},
