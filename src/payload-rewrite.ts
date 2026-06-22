@@ -5,7 +5,7 @@ import type {
 	CustomMessageEntry,
 	SessionEntry,
 	SessionMessageEntry,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import type { ResponsesCompatibleRequestPayload } from "./runtime";
 import { NATIVE_COMPACTION_DISPLAY_MESSAGE_TYPE, type NativeCompactionEntry } from "./types";
 import {

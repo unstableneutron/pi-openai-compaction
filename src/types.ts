@@ -1,4 +1,4 @@
-import type { CompactionEntry, CompactionResult, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { CompactionEntry, CompactionResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export const EXTENSION_ID = "openai-native-compaction";
 export const EXTENSION_SETTINGS_KEY = "openaiNativeCompaction";
@@ -82,6 +82,8 @@ export type NativeCompactionStrategy = typeof NATIVE_COMPACTION_STRATEGY;
 export type NativeCompactionShimSummary = typeof NATIVE_COMPACTION_SHIM_SUMMARY;
 
 export type NativeCompactionRequestMeta = {
+	reason?: "manual" | "threshold" | "overflow";
+	willRetry?: boolean;
 	tokensBefore?: number;
 	previousSummaryPresent?: boolean;
 };
@@ -187,9 +189,15 @@ export function isNativeCompactionRequestMeta(value: unknown): value is NativeCo
 		return false;
 	}
 
-	const { tokensBefore, previousSummaryPresent } = value;
+	const { reason, willRetry, tokensBefore, previousSummaryPresent } = value;
+	if (reason !== undefined && reason !== "manual" && reason !== "threshold" && reason !== "overflow") {
+	  return false;
+	}
+	if (willRetry !== undefined && typeof willRetry !== "boolean") {
+	  return false;
+	}
 	if (tokensBefore !== undefined && !isFiniteNonNegativeNumber(tokensBefore)) {
-		return false;
+	  return false;
 	}
 
 	if (previousSummaryPresent !== undefined && typeof previousSummaryPresent !== "boolean") {
@@ -247,10 +255,12 @@ export function createNativeCompactionDetails(input: CreateNativeCompactionDetai
 		compactResponseId: isNonEmptyString(input.compactResponseId) ? normalizeString(input.compactResponseId) : undefined,
 		createdAt: isNonEmptyString(input.createdAt) ? normalizeString(input.createdAt) : new Date().toISOString(),
 		requestMeta: input.requestMeta
-			? {
-				...(input.requestMeta.tokensBefore !== undefined ? { tokensBefore: input.requestMeta.tokensBefore } : {}),
-				...(input.requestMeta.previousSummaryPresent !== undefined
-					? { previousSummaryPresent: input.requestMeta.previousSummaryPresent }
+		  ? {
+		      ...(input.requestMeta.reason !== undefined ? { reason: input.requestMeta.reason } : {}),
+		      ...(input.requestMeta.willRetry !== undefined ? { willRetry: input.requestMeta.willRetry } : {}),
+		      ...(input.requestMeta.tokensBefore !== undefined ? { tokensBefore: input.requestMeta.tokensBefore } : {}),
+		      ...(input.requestMeta.previousSummaryPresent !== undefined
+		        ? { previousSummaryPresent: input.requestMeta.previousSummaryPresent }
 					: {}),
 			}
 			: undefined,

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { convertToLlm, type CompactionPreparation } from "@mariozechner/pi-coding-agent";
+import { convertToLlm, type CompactionPreparation } from "@earendil-works/pi-coding-agent";
 import type {
 	Api,
 	AssistantMessage,

@@ -3,7 +3,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	SessionBeforeCompactEvent,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { executeNativeCompaction } from "./compact-client";
 import { sanitizeCompactedWindow, summarizeCompactionOutputForDiagnostics } from "./compaction-output";
 import { writeDebugArtifact } from "./debug";
@@ -48,10 +48,46 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function buildCompactionRequestMeta(event: SessionBeforeCompactEvent): NativeCompactionRequestMeta {
-	return {
-		tokensBefore: event.preparation.tokensBefore,
-		previousSummaryPresent: Boolean(event.preparation.previousSummary),
+	const requestMeta: NativeCompactionRequestMeta = {
+	  tokensBefore: event.preparation.tokensBefore,
+	  previousSummaryPresent: Boolean(event.preparation.previousSummary),
 	};
+
+	if (event.reason) {
+	  requestMeta.reason = event.reason;
+	}
+	if (typeof event.willRetry === "boolean") {
+	  requestMeta.willRetry = event.willRetry;
+	}
+
+	return requestMeta;
+}
+
+type SessionContextMessages = ReturnType<ExtensionContext["sessionManager"]["buildSessionContext"]>["messages"];
+
+function isNonStopAssistantLeaf(message: SessionContextMessages[number] | undefined): boolean {
+	return Boolean(
+	  message &&
+	    message.role === "assistant" &&
+	    "stopReason" in message &&
+	    (message as { stopReason?: unknown }).stopReason !== "stop",
+	);
+}
+
+function buildMessagesForNativeCompaction(
+	event: SessionBeforeCompactEvent,
+	messages: SessionContextMessages,
+): SessionContextMessages {
+	if (event.reason !== "overflow" || event.willRetry !== true) {
+	  return messages;
+	}
+
+	const lastMessage = messages[messages.length - 1];
+	if (!isNonStopAssistantLeaf(lastMessage)) {
+	  return messages;
+	}
+
+	return messages.slice(0, -1) as SessionContextMessages;
 }
 
 function getCurrentModelDebugInfo(ctx: ExtensionContext) {
@@ -197,13 +233,41 @@ function buildRequestTemplateIdentity(
 	};
 }
 
-function buildCompactionInstructions(systemPrompt: string, customInstructions?: string): string {
-	const guidance = customInstructions?.trim();
-	if (!guidance) {
-		return systemPrompt;
+function buildCompactionTriggerGuidance(reason: SessionBeforeCompactEvent["reason"], willRetry: boolean): string | undefined {
+	if (reason === "threshold") {
+	  return "This is threshold auto-compaction. Preserve durable progress, current task state, file paths, tool results, and next steps while reducing older context.";
 	}
 
-	return `${systemPrompt}\n\nAdditional user guidance for this manual /compact request:\n${guidance}`;
+	if (reason === "overflow" && willRetry) {
+	  return "This is context-overflow recovery and Pi will retry the aborted turn after compaction. Preserve enough state to retry the active user request, but do not treat the overflow/error assistant leaf as completed progress.";
+	}
+
+	if (reason === "overflow") {
+	  return "This is context-overflow compaction after a completed assistant response. Preserve completed assistant output, durable progress, file paths, tool results, and next steps.";
+	}
+
+	return undefined;
+}
+
+function buildCompactionInstructions(
+	systemPrompt: string,
+	customInstructions: string | undefined,
+	reason: SessionBeforeCompactEvent["reason"],
+	willRetry: boolean,
+): string {
+	const guidance = customInstructions?.trim();
+	const triggerGuidance = buildCompactionTriggerGuidance(reason, willRetry);
+	const sections = [systemPrompt];
+
+	if (triggerGuidance) {
+	  sections.push(`Compaction trigger guidance:\n${triggerGuidance}`);
+	}
+
+	if (guidance) {
+	  sections.push(`Additional user guidance for this manual /compact request:\n${guidance}`);
+	}
+
+	return sections.join("\n\n");
 }
 
 async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piContext: ExtensionContext) {
@@ -216,6 +280,8 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 		"compaction-event",
 		{
 			event: "session_before_compact",
+			reason: event.reason,
+			willRetry: event.willRetry,
 			customInstructions: event.customInstructions,
 			preparation: {
 				tokensBefore: event.preparation.tokensBefore,
@@ -256,7 +322,12 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 	}
 
 	const runtime = resolution.runtime;
-	const instructions = buildCompactionInstructions(piContext.getSystemPrompt(), event.customInstructions);
+	const instructions = buildCompactionInstructions(
+		piContext.getSystemPrompt(),
+		event.customInstructions,
+		event.reason,
+		event.willRetry,
+	);
 	const branchEntries = piContext.sessionManager.getBranch();
 	const latestNativeCompaction = resolveLatestNativeCompactionEntry(branchEntries, {
 		provider: runtime.provider,
@@ -301,7 +372,7 @@ async function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, piCo
 		requestSource = latestNativeCompaction.reason === "no-compaction" ? "session-context" : "non-native-compaction-context";
 		request = serializeMessagesToCompactRequest({
 			model: runtime.currentModel,
-			messages: piContext.sessionManager.buildSessionContext().messages,
+			messages: buildMessagesForNativeCompaction(event, piContext.sessionManager.buildSessionContext().messages),
 			instructions,
 		});
 	}

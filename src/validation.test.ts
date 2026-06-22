@@ -86,7 +86,7 @@ let serializerImportCounter = 0;
 let timestampCounter = 0;
 
 function registerPiCodingAgentMock(): void {
-	mock.module("@mariozechner/pi-coding-agent", () => ({
+	mock.module("@earendil-works/pi-coding-agent", () => ({
 		convertToLlm: (messages: Array<Record<string, unknown>>) =>
 			messages
 				.map((message) => {
@@ -458,6 +458,8 @@ test("manual /compact preserves tool/result ordering + assistant phases and pers
 	const event = {
 		signal: new AbortController().signal,
 		customInstructions: undefined,
+		reason: "manual",
+		willRetry: false,
 		preparation: {
 			tokensBefore: 512,
 			firstKeptEntryId: user.id,
@@ -496,7 +498,92 @@ test("manual /compact preserves tool/result ordering + assistant phases and pers
 	expect(result.compaction.summary).toBe(NATIVE_COMPACTION_SHIM_SUMMARY);
 	expect(result.compaction.firstKeptEntryId).toBe(user.id);
 	expect(result.compaction.tokensBefore).toBe(512);
-	expect((result.compaction.details as { compactedWindow: unknown[] }).compactedWindow).toEqual(compactedWindow);
+	const details = result.compaction.details as { compactedWindow: unknown[]; requestMeta?: Record<string, unknown> };
+	expect(details.compactedWindow).toEqual(compactedWindow);
+	expect(details.requestMeta).toEqual({
+		reason: "manual",
+		willRetry: false,
+		tokensBefore: 512,
+		previousSummaryPresent: false,
+	});
+});
+
+test("overflow retry native compaction omits the failed terminal assistant leaf", async () => {
+	const { sessionBeforeCompact, compactCalls } = await loadHookHarness();
+	const user = createUserEntry("overflow_user", "Please continue the large task.");
+	const failedAssistant = createAssistantEntry(
+		"overflow_assistant",
+		[createTextBlock("model_context_window_exceeded: input was too large", "final_answer")],
+		defaultModel,
+		"error",
+	);
+	const sessionContextMessages = [toReplayMessage(user), toReplayMessage(failedAssistant)];
+
+	const result = (await sessionBeforeCompact(
+		{
+			type: "session_before_compact",
+			branchEntries: [user, failedAssistant],
+			signal: new AbortController().signal,
+			customInstructions: undefined,
+			reason: "overflow",
+			willRetry: true,
+			preparation: {
+				tokensBefore: 1024,
+				firstKeptEntryId: user.id,
+				previousSummary: undefined,
+				messagesToSummarize: sessionContextMessages,
+				turnPrefixMessages: [],
+			},
+		},
+		createContext({ branchEntries: [user, failedAssistant], sessionContextMessages }),
+	)) as { compaction?: { details?: { requestMeta?: Record<string, unknown> } } };
+
+	expect(compactCalls).toHaveLength(1);
+	const compactRequest = compactCalls[0]?.request as { instructions: string; input: unknown[] };
+	const compactInput = JSON.stringify(compactRequest.input);
+	expect(compactInput).toContain("Please continue the large task.");
+	expect(compactInput).not.toContain("model_context_window_exceeded");
+	expect(compactRequest.instructions).toContain("Pi will retry the aborted turn after compaction");
+	expect(result.compaction?.details?.requestMeta).toEqual({
+		reason: "overflow",
+		willRetry: true,
+		tokensBefore: 1024,
+		previousSummaryPresent: false,
+	});
+});
+
+test("overflow compaction without retry preserves completed assistant output", async () => {
+	const { sessionBeforeCompact, compactCalls } = await loadHookHarness();
+	const user = createUserEntry("overflow_completed_user", "Summarize the completed answer.");
+	const completedAssistant = createAssistantEntry(
+		"overflow_completed_assistant",
+		[createTextBlock("Completed assistant answer that should remain available.", "final_answer")],
+	);
+	const sessionContextMessages = [toReplayMessage(user), toReplayMessage(completedAssistant)];
+
+	await sessionBeforeCompact(
+		{
+			type: "session_before_compact",
+			branchEntries: [user, completedAssistant],
+			signal: new AbortController().signal,
+			customInstructions: undefined,
+			reason: "overflow",
+			willRetry: false,
+			preparation: {
+				tokensBefore: 2048,
+				firstKeptEntryId: user.id,
+				previousSummary: undefined,
+				messagesToSummarize: sessionContextMessages,
+				turnPrefixMessages: [],
+			},
+		},
+		createContext({ branchEntries: [user, completedAssistant], sessionContextMessages }),
+	);
+
+	const compactRequest = compactCalls[0]?.request as { instructions: string; input: unknown[] };
+	const compactInput = JSON.stringify(compactRequest.input);
+	expect(compactInput).toContain("Completed assistant answer that should remain available.");
+	expect(compactRequest.instructions).toContain("completed assistant response");
 });
 
 test("manual /compact reuses Codex v1 fields from the last matching Responses request", async () => {

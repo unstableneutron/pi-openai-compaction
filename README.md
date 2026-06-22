@@ -12,7 +12,7 @@ This package preserves the raw compacted window returned by OpenAI's compact end
 
 This package is intentionally narrow.
 
-- **Minimum Pi version:** `@mariozechner/pi-coding-agent >= 0.63.0`
+- **Minimum Pi version:** `@earendil-works/pi-coding-agent >= 0.79.10`
 - **Providers:** `openai`, `openai-codex`
 - **APIs:** `openai-responses`, `openai-codex-responses`
 - **Failure mode:** fail open back to normal Pi behavior
@@ -23,7 +23,9 @@ This package is intentionally narrow.
 The extension uses two hooks:
 
 1. `session_before_compact`
-   - serialize the current Pi session into an OpenAI Responses-compatible compact request
+- serialize the current Pi session into an OpenAI Responses-compatible compact request
+- persist Pi's compaction `reason` / `willRetry` metadata with the native checkpoint
+- for overflow compactions that Pi will retry, omit the failed terminal assistant leaf so the native compacted window matches the retry context
    - call the compact endpoint
    - validate and persist the returned compacted window in the compaction entry details
    - if native compact fails after a prior native compact, keep that prior opaque window available for Pi's fallback summarizer
@@ -33,7 +35,12 @@ The extension uses two hooks:
    - tolerate omitted kept windows, pending live input, and Pi fallback compactions after an older native compact
 3. `session_compact` / `context`
    - add a visible native-compaction marker to the session
-   - keep that marker out of LLM context and replay payloads
+- keep that marker out of LLM context and replay payloads
+
+The extension does not schedule continuations or retries. It relies on Pi core's
+`willRetry` coordination so packages such as `pi-codex-goals` and `pi-retry` can
+avoid duplicate post-compaction work while Pi is already retrying an overflowed
+turn.
 
 ## Install
 
